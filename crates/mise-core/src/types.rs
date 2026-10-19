@@ -39,3 +39,10 @@ pub struct ConfigSource {
 fn default_true() -> bool {
     true
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteVersion {
+    pub version: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
