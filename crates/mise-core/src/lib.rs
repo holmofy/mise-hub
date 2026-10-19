@@ -1,6 +1,7 @@
 pub mod error;
 pub mod install;
 pub mod locator;
+pub mod mise;
 pub mod registry;
 pub mod project;
 pub mod remote;
@@ -10,6 +11,7 @@ pub mod tools;
 pub mod types;
 
 pub use error::CoreError;
+pub use mise::Mise;
 pub use locator::{default_candidates, locate_in, locate_mise};
 pub use registry::parse_registry;
 pub use project::{default_store_path, Project, ProjectStore};
