@@ -20,7 +20,7 @@ impl Mise {
     }
 
     pub fn version(&self) -> Result<String, CoreError> {
-        let out = self.run(&[], None)?;
+        let out = self.run(&["--version"], None)?;
         Ok(out.stdout.split_whitespace().next().unwrap_or_default().to_string())
     }
 
@@ -120,8 +120,9 @@ mod tests {
 
     #[test]
     fn parses_version_first_token() {
-        let (m, _) = mise("2026.10.13 macos-arm64 (2026-10-17)\n");
+        let (m, seen) = mise("2026.10.13 macos-arm64 (2026-10-17)\n");
         assert_eq!(m.version().unwrap(), "2026.10.13");
+        assert_eq!(seen.lock().unwrap()[0], vec!["--version"]);
     }
 
     #[test]
