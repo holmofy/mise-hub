@@ -1,33 +1,26 @@
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::*;
 
-struct RootView;
+mod app;
+mod i18n;
+mod state;
+mod views;
 
-impl Render for RootView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .child("mise-hub")
-            .child(
-                Button::new("ping")
-                    .primary()
-                    .label("Ping")
-                    .on_click(|_, _, _| println!("pong")),
-            )
-    }
-}
+use app::RootView;
+
+// i18n: the generated lookup machinery (the `_rust_i18n_t!` macro, backend, and
+// `_rust_i18n_*` helpers) uses `crate::`-relative paths, so it must be expanded
+// here at the crate root for `t!` in the view modules to resolve.
+rust_i18n::i18n!("locales", fallback = "en");
 
 fn main() {
     application()
         .with_assets(assets::Assets)
         .run(|cx| {
             init(cx);
-            open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| RootView))
-                .expect("failed to open window");
+            i18n::init("en");
+            open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| RootView::new(window, cx))
+            })
+            .expect("failed to open window");
         });
 }
