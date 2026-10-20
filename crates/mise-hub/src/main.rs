@@ -20,8 +20,17 @@ fn main() {
             init(cx);
 
             let settings_path = mise_core::default_settings_path();
-            let settings =
-                mise_core::AppSettings::load(&settings_path).unwrap_or_default();
+            let settings = if settings_path.exists() {
+                mise_core::AppSettings::load(&settings_path).unwrap_or_default()
+            } else {
+                // First launch: follow the system language, then persist the
+                // resolved locale so subsequent launches are stable.
+                let mut settings = mise_core::AppSettings::default();
+                settings.locale =
+                    i18n::locale_from_system(sys_locale::get_locale().as_deref()).into();
+                let _ = settings.save(&settings_path);
+                settings
+            };
             i18n::init(&settings.locale);
 
             open_window(WindowOptions::default(), cx, move |window, cx| {

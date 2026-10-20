@@ -21,3 +21,33 @@ pub fn init(locale: &str) {
 pub fn set_locale(locale: &str) {
     rust_i18n::set_locale(locale);
 }
+
+/// Map a raw system locale string (as returned by `sys_locale::get_locale`) to
+/// one of the two supported locale codes.
+///
+/// Any locale whose language subtag starts with `zh` (case-insensitive) maps to
+/// `"zh-CN"`; everything else, including `None` (no system locale detected),
+/// maps to `"en"`.
+pub fn locale_from_system(raw: Option<&str>) -> &'static str {
+    match raw.and_then(|locale| locale.get(..2)) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("zh") => "zh-CN",
+        _ => "en",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locale_from_system_maps_zh_locales() {
+        assert_eq!(locale_from_system(Some("zh-CN")), "zh-CN");
+        assert_eq!(locale_from_system(Some("zh_Hans_CN")), "zh-CN");
+    }
+
+    #[test]
+    fn locale_from_system_falls_back_to_english() {
+        assert_eq!(locale_from_system(Some("en-US")), "en");
+        assert_eq!(locale_from_system(None), "en");
+    }
+}
