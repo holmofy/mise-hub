@@ -5,8 +5,8 @@ use crate::runner::{CommandOutput, CommandRequest, CommandRunner, StreamEvent, S
 use crate::tools::InstalledSet;
 use crate::types::{RemoteVersion, ToolEntry};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 
 pub struct Mise {
     program: PathBuf,
@@ -15,13 +15,26 @@ pub struct Mise {
 }
 
 impl Mise {
-    pub fn new(program: PathBuf, runner: Arc<dyn CommandRunner>, streamer: Arc<dyn StreamingRunner>) -> Self {
-        Self { program, runner, streamer }
+    pub fn new(
+        program: PathBuf,
+        runner: Arc<dyn CommandRunner>,
+        streamer: Arc<dyn StreamingRunner>,
+    ) -> Self {
+        Self {
+            program,
+            runner,
+            streamer,
+        }
     }
 
     pub fn version(&self) -> Result<String, CoreError> {
         let out = self.run(&["--version"], None)?;
-        Ok(out.stdout.split_whitespace().next().unwrap_or_default().to_string())
+        Ok(out
+            .stdout
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string())
     }
 
     pub fn registry(&self) -> Result<Vec<ToolEntry>, CoreError> {
@@ -34,7 +47,11 @@ impl Mise {
         InstalledSet::parse(&out.stdout)
     }
 
-    pub fn remote_versions(&self, tool: &str, project_root: Option<&Path>) -> Result<Vec<RemoteVersion>, CoreError> {
+    pub fn remote_versions(
+        &self,
+        tool: &str,
+        project_root: Option<&Path>,
+    ) -> Result<Vec<RemoteVersion>, CoreError> {
         let out = self.run(&["ls-remote", tool, "--json"], project_root)?;
         parse_remote_versions(&out.stdout)
     }
@@ -48,7 +65,11 @@ impl Mise {
         let spec = format!("{tool}@{version}");
         let mut args = self.base_args(project_root);
         args.extend(["install".into(), spec]);
-        self.streamer.spawn(CommandRequest { program: self.program.clone(), args, cwd: None })
+        self.streamer.spawn(CommandRequest {
+            program: self.program.clone(),
+            args,
+            cwd: None,
+        })
     }
 
     fn base_args(&self, project_root: Option<&Path>) -> Vec<String> {
@@ -67,7 +88,10 @@ impl Mise {
             cwd: None,
         })?;
         if out.code != 0 {
-            return Err(CoreError::CommandFailed { code: out.code, stderr: out.stderr });
+            return Err(CoreError::CommandFailed {
+                code: out.code,
+                stderr: out.stderr,
+            });
         }
         Ok(out)
     }
@@ -87,21 +111,34 @@ mod tests {
     impl CommandRunner for RecordingRunner {
         fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
             self.seen.lock().unwrap().push(req.args.clone());
-            Ok(CommandOutput { code: 0, stdout: self.stdout.clone(), stderr: String::new() })
+            Ok(CommandOutput {
+                code: 0,
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
         }
     }
 
     struct NoopStreamer;
     impl StreamingRunner for NoopStreamer {
-        fn spawn(&self, _req: CommandRequest) -> Result<std::sync::mpsc::Receiver<StreamEvent>, CoreError> {
+        fn spawn(
+            &self,
+            _req: CommandRequest,
+        ) -> Result<std::sync::mpsc::Receiver<StreamEvent>, CoreError> {
             Ok(std::sync::mpsc::channel().1)
         }
     }
 
     fn mise(stdout: &str) -> (Mise, Arc<Mutex<Vec<Vec<String>>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let runner = Arc::new(RecordingRunner { seen: seen.clone(), stdout: stdout.into() });
-        (Mise::new("mise".into(), runner, Arc::new(NoopStreamer)), seen)
+        let runner = Arc::new(RecordingRunner {
+            seen: seen.clone(),
+            stdout: stdout.into(),
+        });
+        (
+            Mise::new("mise".into(), runner, Arc::new(NoopStreamer)),
+            seen,
+        )
     }
 
     #[test]
@@ -129,7 +166,10 @@ mod tests {
     fn tool_name_with_backend_prefix_is_verbatim() {
         let (m, seen) = mise("[]");
         let _ = m.remote_versions("npm:prettier", None);
-        assert_eq!(seen.lock().unwrap()[0], vec!["ls-remote", "npm:prettier", "--json"]);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["ls-remote", "npm:prettier", "--json"]
+        );
     }
 
     #[test]
@@ -137,7 +177,11 @@ mod tests {
         struct Failing;
         impl CommandRunner for Failing {
             fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
-                Ok(CommandOutput { code: 2, stdout: String::new(), stderr: "boom".into() })
+                Ok(CommandOutput {
+                    code: 2,
+                    stdout: String::new(),
+                    stderr: "boom".into(),
+                })
             }
         }
         let m = Mise::new("mise".into(), Arc::new(Failing), Arc::new(NoopStreamer));

@@ -5,7 +5,7 @@ mod tests {
     use super::*;
     use crate::error::CoreError;
     use crate::runner::CommandRequest;
-    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::mpsc::{Receiver, channel};
 
     struct FakeStreamer {
         events: Vec<StreamEvent>,

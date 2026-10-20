@@ -26,7 +26,11 @@ impl ProjectStore {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| id.clone());
-        self.projects.push(Project { id, path: canonical, name });
+        self.projects.push(Project {
+            id,
+            path: canonical,
+            name,
+        });
         Ok(self.projects.last().expect("just pushed"))
     }
 
@@ -70,7 +74,14 @@ mod tests {
         store.add(dir.path()).unwrap();
         store.add(dir.path()).unwrap();
         assert_eq!(store.projects.len(), 1);
-        assert_eq!(store.projects[0].name, dir.path().file_name().unwrap().to_string_lossy().to_string());
+        assert_eq!(
+            store.projects[0].name,
+            dir.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
     }
 
     #[test]

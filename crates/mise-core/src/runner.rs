@@ -2,7 +2,7 @@ use crate::error::CoreError;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRequest {

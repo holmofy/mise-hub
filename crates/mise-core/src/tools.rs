@@ -33,7 +33,9 @@ pub struct InstalledSet {
 
 impl InstalledSet {
     pub fn parse(json: &str) -> Result<Self, CoreError> {
-        Ok(Self { tools: serde_json::from_str(json)? })
+        Ok(Self {
+            tools: serde_json::from_str(json)?,
+        })
     }
 
     pub fn rows(&self, project_root: Option<&Path>) -> Vec<ToolRow> {
@@ -93,8 +95,14 @@ mod tests {
     fn classifies_by_project_root() {
         let set = InstalledSet::parse(SAMPLE).unwrap();
         let rows = set.rows(Some(Path::new("/proj")));
-        assert!(rows.iter().any(|r| r.name == "node" && r.version == "20.11.0" && r.scope == Scope::Project));
-        assert!(rows.iter().any(|r| r.name == "node" && r.version == "22.9.0" && r.scope == Scope::Global));
+        assert!(
+            rows.iter()
+                .any(|r| r.name == "node" && r.version == "20.11.0" && r.scope == Scope::Project)
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.name == "node" && r.version == "22.9.0" && r.scope == Scope::Global)
+        );
     }
 
     #[test]
@@ -111,15 +119,25 @@ mod tests {
           {"version":"1.22.0","source":null,"installed":true,"active":false},
           {"version":"1.23.0","source":{"type":"mise.toml"},"installed":true,"active":false}
         ]}"#;
-        let rows = InstalledSet::parse(json).unwrap().rows(Some(Path::new("/proj")));
+        let rows = InstalledSet::parse(json)
+            .unwrap()
+            .rows(Some(Path::new("/proj")));
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.scope == Scope::Global && r.source_path.is_none()));
-        assert!(rows.iter().all(|r| r.requested_version.is_none() && r.install_path.is_none()));
+        assert!(
+            rows.iter()
+                .all(|r| r.scope == Scope::Global && r.source_path.is_none())
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.requested_version.is_none() && r.install_path.is_none())
+        );
     }
 
     #[test]
     fn filters_by_scope() {
-        let rows = InstalledSet::parse(SAMPLE).unwrap().rows(Some(Path::new("/proj")));
+        let rows = InstalledSet::parse(SAMPLE)
+            .unwrap()
+            .rows(Some(Path::new("/proj")));
         assert_eq!(filter_rows(&rows, ScopeFilter::Project).len(), 1);
         assert_eq!(filter_rows(&rows, ScopeFilter::Global).len(), 2);
         assert_eq!(filter_rows(&rows, ScopeFilter::All).len(), 3);
