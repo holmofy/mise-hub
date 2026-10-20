@@ -1,5 +1,5 @@
 use mise_core::{Mise, ProjectStore, ScopeFilter, ToolEntry, ToolRow, filter_rows};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
@@ -44,6 +44,10 @@ pub struct AppState {
     pub mise: Option<Mise>,
     pub mise_version: Option<String>,
     pub projects: ProjectStore,
+    /// Where `add_project` / `remove_project` persist the store. Production
+    /// uses the real user store; tests must point this at a tempdir-backed
+    /// path so the developer's `projects.json` is never written.
+    pub store_path: PathBuf,
     pub selection: Selection,
     pub registry: Loadable<Vec<ToolEntry>>,
     pub installed: Loadable<Vec<ToolRow>>,
@@ -56,11 +60,20 @@ impl AppState {
             mise: None,
             mise_version: None,
             projects,
+            store_path: mise_core::default_store_path(),
             selection: Selection::Discover,
             registry: Loadable::Idle,
             installed: Loadable::Idle,
             selected_tool: None,
         }
+    }
+
+    /// Override where the project store is persisted. `RootView` passes the
+    /// real user store path it already resolved; tests must pass a
+    /// `tempfile::tempdir()`-backed path to stay hermetic.
+    pub fn with_store_path(mut self, path: PathBuf) -> Self {
+        self.store_path = path;
+        self
     }
 
     pub fn attach_mise(&mut self, program: std::path::PathBuf) -> bool {
@@ -86,7 +99,7 @@ impl AppState {
 
     pub fn add_project(&mut self, path: &Path) -> Result<(), mise_core::CoreError> {
         self.projects.add(path)?;
-        self.projects.save(&mise_core::default_store_path())?;
+        self.projects.save(&self.store_path)?;
         Ok(())
     }
 
@@ -95,7 +108,7 @@ impl AppState {
         if self.selection.project_id() == Some(id) {
             self.selection = Selection::Discover;
         }
-        let _ = self.projects.save(&mise_core::default_store_path());
+        let _ = self.projects.save(&self.store_path);
     }
 
     pub fn rows(&self, filter: ScopeFilter) -> Vec<ToolRow> {
@@ -199,44 +212,77 @@ mod rows_tests {
 mod project_tests {
     use super::*;
 
+    /// Runs `f`, then asserts the developer's real project store file is
+    /// byte-identical to before. Every store-writing test must point
+    /// `AppState::store_path` at a tempdir (see `isolated_state`); this guard
+    /// fails loudly if a regression ever writes the real user store.
+    fn assert_real_store_untouched(f: impl FnOnce()) {
+        let real = mise_core::default_store_path();
+        let before = std::fs::read(&real).ok();
+        f();
+        assert_eq!(
+            std::fs::read(&real).ok(),
+            before,
+            "test wrote the real project store at {}",
+            real.display()
+        );
+    }
+
+    /// An `AppState` whose store persists into a private tempdir. Each test
+    /// gets its own tempdir, so parallel tests never share a file.
+    fn isolated_state(store: &tempfile::TempDir) -> AppState {
+        AppState::new(ProjectStore::default()).with_store_path(store.path().join("projects.json"))
+    }
+
     #[test]
     fn add_project_dedupes_same_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(ProjectStore::default());
-        state.add_project(dir.path()).unwrap();
-        state.add_project(dir.path()).unwrap();
-        assert_eq!(state.projects.projects.len(), 1);
-        assert_eq!(
-            state.projects.projects[0].name,
-            dir.path()
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
-        );
+        assert_real_store_untouched(|| {
+            let store = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = isolated_state(&store);
+            state.add_project(dir.path()).unwrap();
+            state.add_project(dir.path()).unwrap();
+            assert_eq!(state.projects.projects.len(), 1);
+            // The store file lands in the tempdir, not the user's config dir.
+            assert!(store.path().join("projects.json").exists());
+            assert_eq!(
+                state.projects.projects[0].name,
+                dir.path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            );
+        });
     }
 
     #[test]
     fn remove_selected_project_resets_selection_to_discover() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(ProjectStore::default());
-        let id = state.projects.add(dir.path()).unwrap().id.clone();
-        state.selection = Selection::ProjectTools(id.clone());
+        assert_real_store_untouched(|| {
+            let store = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = isolated_state(&store);
+            let id = state.projects.add(dir.path()).unwrap().id.clone();
+            state.selection = Selection::ProjectTools(id.clone());
 
-        state.remove_project(&id);
-        assert!(state.projects.projects.is_empty());
-        assert_eq!(state.selection, Selection::Discover);
+            state.remove_project(&id);
+            assert!(state.projects.projects.is_empty());
+            assert_eq!(state.selection, Selection::Discover);
+        });
     }
 
     #[test]
     fn remove_other_project_keeps_selection() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(ProjectStore::default());
-        let kept = state.projects.add(dir.path()).unwrap().id.clone();
-        state.selection = Selection::ProjectTools(kept.clone());
+        assert_real_store_untouched(|| {
+            let store = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = isolated_state(&store);
+            let kept = state.projects.add(dir.path()).unwrap().id.clone();
+            state.selection = Selection::ProjectTools(kept.clone());
 
-        state.remove_project("some-other-id");
-        assert_eq!(state.selection, Selection::ProjectTools(kept));
+            state.remove_project("some-other-id");
+            assert_eq!(state.selection, Selection::ProjectTools(kept));
+        });
     }
 }
 

@@ -38,7 +38,7 @@ impl RootView {
     ) -> Self {
         let path = mise_core::default_store_path();
         let projects = mise_core::ProjectStore::load(&path).unwrap_or_default();
-        let mut state = AppState::new(projects);
+        let mut state = AppState::new(projects).with_store_path(path.clone());
         state.detect();
         state.ensure_registry();
 
@@ -62,6 +62,9 @@ impl RootView {
             notice: None,
             _search_subscription: search_subscription,
         };
+        // Mark the installed list as loading before the (synchronous) refresh
+        // so a slow `mise ls` reads as "loading", not as "no tools installed".
+        this.state.installed = Loadable::Loading;
         this.refresh_installed();
         this
     }
@@ -82,6 +85,9 @@ impl RootView {
         self.tool_filter = ScopeFilter::All;
         self.notice = None;
         if self.is_tools_page() {
+            // Same loading marker as startup: the refresh below is synchronous,
+            // but a slow `mise ls` must not be mistaken for an empty list.
+            self.state.installed = Loadable::Loading;
             self.refresh_installed();
         }
         cx.notify();
@@ -190,6 +196,7 @@ impl RootView {
             Loadable::Failed(err) => Some(err.as_str()),
             _ => None,
         };
+        let loading = matches!(self.state.installed, Loadable::Loading);
         let list = tool_list::render(
             cx,
             &self.search_input,
@@ -197,6 +204,7 @@ impl RootView {
             selected_key.as_deref(),
             filter,
             show_filter,
+            loading,
             load_error,
         );
         let detail = match &selected_row {
@@ -206,21 +214,11 @@ impl RootView {
 
         div()
             .flex()
-            .flex_col()
+            .flex_row()
             .flex_1()
             .min_h_0()
-            .when_some(self.notice.clone(), |d, msg| {
-                d.child(notice_banner(cx, &msg))
-            })
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .min_h_0()
-                    .child(list)
-                    .child(detail),
-            )
+            .child(list)
+            .child(detail)
     }
 }
 
@@ -253,6 +251,9 @@ impl Render for RootView {
         if self.state.mise.is_none() {
             let on_detect = cx.listener(|this, _event, _window, cx| {
                 this.state.detect();
+                // Refresh now that mise may be present; otherwise the tools
+                // page would sit on the startup `Loading` marker forever.
+                this.refresh_installed();
                 cx.notify();
             });
             return setup::render(on_detect).into_any_element();
@@ -335,13 +336,30 @@ impl Render for RootView {
             Selection::GlobalTools | Selection::ProjectTools(_) => {
                 self.tools_pane(cx).into_any_element()
             }
-            other => div()
+            _ => div()
                 .flex_1()
                 .h_full()
-                .p_4()
-                .child(format!("{:?}", other))
+                .items_center()
+                .justify_center()
+                .text_color(cx.theme().muted_foreground)
+                .text_sm()
+                .child(t!("nav.not_available").to_string())
                 .into_any_element(),
         };
+
+        // The notice banner renders at the root, above the right pane, on
+        // EVERY page (including Discover): a failed add-project does not
+        // change the page, so a tools-pane-only banner would never be seen
+        // from the default selection (AGENTS.md rule 9: errors must surface).
+        let right_col = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .when_some(self.notice.clone(), |d, msg| {
+                d.child(notice_banner(cx, &msg))
+            })
+            .child(right_pane);
 
         div()
             .flex()
@@ -384,7 +402,7 @@ impl Render for RootView {
                         &self.state.selection,
                         self.projects_collapsed,
                     ))
-                    .child(right_pane),
+                    .child(right_col),
             )
             .into_any_element()
     }

@@ -13,6 +13,7 @@ nav:
   confirm_remove_body: Remove this project from the list? The folder on disk is not touched.
   cancel: Cancel
   remove: Remove
+  not_available: Not available in this milestone
 setup:
   title: mise is not installed
   body: mise-hub needs the mise CLI. Install it, then click Detect again.

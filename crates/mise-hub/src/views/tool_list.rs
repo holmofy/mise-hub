@@ -21,9 +21,10 @@ pub fn row_key(row: &ToolRow) -> String {
 /// Render the installed-tools list: search box, optional scope filter, and the
 /// clickable rows. `rows` is already filtered (scope + search query) by the
 /// caller; `show_filter` decides whether the scope segmented control renders
-/// (project tools page only). `error` replaces the rows with the raw failure
-/// output when loading `mise ls` went wrong (AGENTS.md rule 9: show the real
-/// error, never a bare "failed").
+/// (project tools page only). `loading` shows the loading state so a slow
+/// `mise ls` is distinguishable from "no tools installed". `error` replaces
+/// the rows with the raw failure output when loading `mise ls` went wrong
+/// (AGENTS.md rule 9: show the real error, never a bare "failed").
 pub fn render(
     cx: &mut Context<RootView>,
     search_input: &Entity<InputState>,
@@ -31,6 +32,7 @@ pub fn render(
     selected_key: Option<&str>,
     filter: ScopeFilter,
     show_filter: bool,
+    loading: bool,
     error: Option<&str>,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
@@ -76,6 +78,17 @@ pub fn render(
                         .text_color(theme.muted_foreground)
                         .child(err.to_string()),
                 ),
+        );
+    } else if loading {
+        col = col.child(
+            div()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .text_color(theme.muted_foreground)
+                .text_sm()
+                .child(t!("tools.loading").to_string()),
         );
     } else if rows.is_empty() {
         col = col.child(

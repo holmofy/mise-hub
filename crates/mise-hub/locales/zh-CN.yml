@@ -13,6 +13,7 @@ nav:
   confirm_remove_body: 从列表中移除该项目？磁盘上的文件夹不会被改动。
   cancel: 取消
   remove: 移除
+  not_available: 本里程碑暂未实现
 setup:
   title: 尚未安装 mise
   body: mise-hub 需要 mise 命令行工具。安装后点击「重新检测」。
