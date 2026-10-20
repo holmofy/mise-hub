@@ -1,7 +1,7 @@
 use crate::i18n;
 use crate::state::{AppState, Loadable, Selection};
 use crate::theme;
-use crate::views::{discover, setup, sidebar, tool_detail, tool_list};
+use crate::views::{discover, setup, sidebar, terminal, tool_detail, tool_list};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::StyledExt;
@@ -12,7 +12,7 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use mise_core::{AppSettings, ScopeFilter, SearchHit, ToolRow};
+use mise_core::{AppSettings, ScopeFilter, SearchHit, StreamEvent, ToolRow};
 use rust_i18n::t;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -143,6 +143,135 @@ impl RootView {
         }
     }
 
+    /// Pick a tool on the discover page and START loading its remote
+    /// versions asynchronously: the blocking `mise ls-remote` call runs on a
+    /// background thread; the UI thread only awaits the bridged channel via
+    /// `cx.spawn` (never touching the entity off-thread), so the page keeps
+    /// rendering while versions load. A failure is surfaced verbatim in the
+    /// versions panel (AGENTS.md rule 9), never as a blank area.
+    pub(crate) fn select_discover_tool(&mut self, tool: String, cx: &mut Context<Self>) {
+        self.state.selected_tool = Some(tool.clone());
+        self.state.versions_tool = Some(tool.clone());
+        self.state.versions = Loadable::Loading;
+        cx.notify();
+
+        let Some(mise) = self.state.mise.clone() else {
+            self.state.versions = Loadable::Failed(t!("discover.versions_unavailable").to_string());
+            cx.notify();
+            return;
+        };
+        let (tx, rx) = async_channel::unbounded();
+        let thread_tool = tool.clone();
+        std::thread::spawn(move || {
+            let result = mise.remote_versions(&thread_tool, None);
+            tx.send_blocking(result).ok();
+        });
+        let expected_tool = tool;
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    // Only apply while this result is still the picked tool
+                    // (a stale fetch must not clobber a newer selection).
+                    if this.state.versions_tool.as_deref() == Some(&expected_tool) {
+                        this.state.versions = match result {
+                            Ok(v) => Loadable::Ready(v),
+                            Err(e) => Loadable::Failed(e.to_string()),
+                        };
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Start an install (install ONLY, never `mise use` — AGENTS.md rule 4)
+    /// and stream its output into a new terminal session. The std receiver
+    /// from core is bridged onto an async channel by a background thread —
+    /// the UI thread only awaits, never touching the entity off-thread.
+    pub(crate) fn run_install(&mut self, tool: &str, version: &str, cx: &mut Context<Self>) {
+        let rx = match self.state.start_install(tool, version) {
+            Ok(rx) => rx,
+            Err(e) => {
+                // Surface the raw error inside its own terminal tab, as a
+                // failed run (AGENTS.md rule 9), not a silent nothing.
+                self.state
+                    .terminal
+                    .begin(format!("install {tool}@{version}"));
+                self.state
+                    .terminal
+                    .push_event(StreamEvent::Stderr(e.to_string()));
+                self.state.terminal.push_event(StreamEvent::Exited(-1));
+                cx.notify();
+                return;
+            }
+        };
+
+        let (tx, async_rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            for event in rx {
+                if tx.send_blocking(event).is_err() {
+                    break;
+                }
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = async_rx.recv().await {
+                let done = matches!(event, StreamEvent::Exited(_));
+                this.update(cx, |this, cx| {
+                    this.state.terminal.push_event(event.clone());
+                    if done {
+                        // Refresh only on completion: rule 4 — after the
+                        // install finished the panel can honestly show
+                        // 「已安装 · 未生效」 with the apply actions exposed.
+                        this.refresh_installed();
+                    }
+                    cx.notify();
+                })
+                .ok();
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Save the active terminal session's text through an rfd save dialog.
+    /// The dialog runs inside the foreground async task (main thread), like
+    /// `prompt_add_project`; the file write happens after the pick.
+    pub(crate) fn save_terminal_log(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let Some(path) = rfd::FileDialog::new()
+                .set_file_name("mise-install.log")
+                .save_file()
+            else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let Some(text) = this.state.terminal.active_text() else {
+                    return;
+                };
+                match std::fs::write(&path, text) {
+                    Ok(()) => this.notice = None,
+                    Err(e) => this.notice = Some(e.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Copy the active session's text to the clipboard.
+    pub(crate) fn copy_terminal(&self, cx: &App) {
+        if let Some(text) = self.state.terminal.active_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
     /// Compute the discover-page search/browse results once per render. The
     /// virtual list only slices `discover_hits` afterwards, so scrolling does
     /// not re-run the search, and the index itself is cached in `AppState`
@@ -164,6 +293,12 @@ impl RootView {
             .ready()
             .map(|rows| rows.iter().map(|r| r.name.clone()).collect())
             .unwrap_or_default();
+        // Version shown as 「已安装 · 未生效」 for the picked tool (rule 4).
+        let not_active_version = self
+            .state
+            .versions_tool
+            .as_deref()
+            .and_then(|tool| self.state.installed_but_not_active(tool));
         discover::render(
             cx,
             &self.discover_input,
@@ -171,6 +306,9 @@ impl RootView {
             &installed_names,
             &self.discover_scroll,
             &self.state.registry,
+            &self.state.versions,
+            self.state.versions_tool.as_deref(),
+            not_active_version,
         )
     }
 
@@ -432,6 +570,10 @@ impl Render for RootView {
             })
             .child(right_pane);
 
+        // Bottom terminal panel: only meaningful once a run exists — before
+        // that the layout stays undiscovered-clean.
+        let has_sessions = !self.state.terminal.sessions.is_empty();
+
         div()
             .flex()
             .flex_col()
@@ -475,6 +617,9 @@ impl Render for RootView {
                     ))
                     .child(right_col),
             )
+            .when(has_sessions, |root| {
+                root.child(terminal::render(&self.state.terminal, cx))
+            })
             .into_any_element()
     }
 }

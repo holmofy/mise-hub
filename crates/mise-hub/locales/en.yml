@@ -47,7 +47,23 @@ discover:
   installed: Installed
   install: Install
   versions: Versions
+  pick_tool: Pick a tool to see its available versions
+  installed_not_active: Installed · not active yet
+  installed_at_version: Installed version
+  apply_project: Apply to this project
+  apply_global: Apply globally
+  apply_m2_note: Not available yet — mise use is planned for M2
+  loading_versions: Loading versions…
+  versions_failed: Failed to load versions
+  versions_unavailable: mise is not available
 terminal:
   save: Save
   copy: Copy
   clear: Clear
+  save_note: Save the run output to a log file
+  clear_keeps_tab: Clears the output but keeps the run tab
+  running: Running
+  succeeded: Succeeded
+  failed: Failed
+  expand: Show terminal
+  collapse: Collapse

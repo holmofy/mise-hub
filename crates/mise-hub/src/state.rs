@@ -1,6 +1,7 @@
 use mise_core::{CoreError, Mise, ProjectStore, ScopeFilter, ToolEntry, ToolRow, filter_rows};
-use mise_core::{SearchHit, SearchIndex};
+use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
@@ -42,7 +43,7 @@ impl<T> Loadable<T> {
 }
 
 pub struct AppState {
-    pub mise: Option<Mise>,
+    pub mise: Option<Arc<Mise>>,
     pub mise_version: Option<String>,
     pub projects: ProjectStore,
     /// Where `add_project` / `remove_project` persist the store. Production
@@ -58,6 +59,15 @@ pub struct AppState {
     /// registry entries. `search` falls back to rebuilding from `registry`
     /// when this is absent (tests assign the registry directly).
     search_index: Option<SearchIndex>,
+    /// Remote versions for the tool the user picked on the discover page.
+    /// Async-filled by the view through `queue_remote_versions`; a failure
+    /// keeps the raw error in `Loadable::Failed` for the panel to render.
+    pub versions: Loadable<Vec<RemoteVersion>>,
+    /// Which tool `versions` belongs to; guards against a stale result
+    /// arriving after the user picked another tool.
+    pub versions_tool: Option<String>,
+    /// Bottom terminal panel sessions.
+    pub terminal: TerminalState,
 }
 
 impl AppState {
@@ -72,6 +82,9 @@ impl AppState {
             installed: Loadable::Idle,
             selected_tool: None,
             search_index: None,
+            versions: Loadable::Idle,
+            versions_tool: None,
+            terminal: TerminalState::default(),
         }
     }
 
@@ -87,11 +100,11 @@ impl AppState {
         if !program.is_file() {
             return false;
         }
-        let mise = Mise::new(
+        let mise = Arc::new(Mise::new(
             program,
             std::sync::Arc::new(mise_core::ProcessRunner),
             std::sync::Arc::new(mise_core::ProcessStreamer),
-        );
+        ));
         self.mise_version = mise.version().ok();
         self.mise = Some(mise);
         true
@@ -144,6 +157,42 @@ impl AppState {
         Ok(())
     }
 
+    /// Start `mise install tool@version` (install ONLY — never `mise use`,
+    /// AGENTS.md rule 4), open a new terminal session for it, and hand the
+    /// event receiver to the caller; the VIEW consumes it on the UI thread.
+    /// Does not touch any UI state beyond the terminal session.
+    pub fn start_install(
+        &mut self,
+        tool: &str,
+        version: &str,
+    ) -> Result<std::sync::mpsc::Receiver<StreamEvent>, mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let root = self.current_project_root();
+        let rx = mise.install_stream(tool, version, root.as_deref())?;
+        self.terminal.begin(format!("install {tool}@{version}"));
+        Ok(rx)
+    }
+
+    /// The install state of a tool as the UI should present it, per AGENTS.md
+    /// rule 4: installing and activating are separate steps. `Some(version)`
+    /// means the tool is on the machine but NOT active in the current
+    /// project (discover installs always go global — no `mise.toml` is ever
+    /// written from here).
+    pub fn installed_but_not_active(&self, tool: &str) -> Option<String> {
+        let rows = self.installed.ready()?;
+        let matching: Vec<&mise_core::ToolRow> = rows.iter().filter(|r| r.name == tool).collect();
+        let active_in_project = matching
+            .iter()
+            .any(|r| r.scope == mise_core::Scope::Project && r.active);
+        if !active_in_project {
+            matching.first().map(|r| r.version.clone())
+        } else {
+            None
+        }
+    }
+
     /// Ensure the tool registry is loaded exactly once.
     ///
     /// Runs `mise registry --json` through `mise-core` (blocking call; the
@@ -191,6 +240,372 @@ impl AppState {
             Loadable::Ready(entries) => SearchIndex::new(entries.clone()).search(query, limit),
             _ => vec![],
         }
+    }
+}
+
+/// Which output stream a terminal line came from; drives its color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// One rendered line in a terminal session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalLine {
+    pub stream: Stream,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStatus {
+    Running,
+    Succeeded,
+    Failed(i32),
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalSession {
+    /// Unique id (returned by `TerminalState::begin`); not used by the UI
+    /// yet — the tab bar addresses sessions by index — but kept as the
+    /// stable handle for future `terminal.close(id)`.
+    #[allow(dead_code)]
+    pub id: String,
+    pub title: String,
+    pub lines: Vec<TerminalLine>,
+    pub status: RunStatus,
+}
+
+impl TerminalSession {
+    /// Append raw output text to this session, shaped like real process
+    /// output: the streamer emits one logical line per event (its `lines()`
+    /// already strips the trailing `\n`), ANSI escape sequences are stripped
+    /// so raw codes never reach the user (red line), and a line containing
+    /// carriage returns is a progress update — its final fragment REPLACES
+    /// the previous line instead of appending a new one.
+    fn feed(&mut self, stream: Stream, text: &str) {
+        let clean = strip_ansi(text);
+        // Allow multi-line payloads: everything before a `\n` is complete.
+        for (ix, piece) in clean.split('\n').enumerate() {
+            let is_last = ix == clean.split('\n').count() - 1;
+            if is_last && piece.is_empty() && clean.ends_with('\n') {
+                break; // trailing newline: no empty line
+            }
+            if piece.contains('\r') {
+                // Progress bar: the last fragment is the visible state.
+                let visible = piece.rsplit('\r').next().unwrap_or("");
+                match self.lines.last_mut() {
+                    Some(line) => line.text = visible.to_string(),
+                    None => self.lines.push(TerminalLine {
+                        stream,
+                        text: visible.to_string(),
+                    }),
+                }
+            } else {
+                self.lines.push(TerminalLine {
+                    stream,
+                    text: piece.to_string(),
+                });
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TerminalState {
+    pub sessions: Vec<TerminalSession>,
+    pub active: usize,
+    pub visible: bool,
+}
+
+impl TerminalState {
+    /// Open a new run, focus it, and make the panel visible. Ids are unique
+    /// (tabs are addressed by index; titles may repeat).
+    pub fn begin(&mut self, title: impl Into<String>) -> String {
+        let id = format!("term-{}", self.sessions.len() + 1);
+        self.sessions.push(TerminalSession {
+            id: id.clone(),
+            title: title.into(),
+            lines: vec![],
+            status: RunStatus::Running,
+        });
+        self.active = self.sessions.len() - 1;
+        self.visible = true;
+        id
+    }
+
+    pub fn active_session(&self) -> Option<&TerminalSession> {
+        self.sessions.get(self.active)
+    }
+
+    /// Focus a session by index; out-of-range indexes are ignored so a
+    /// stale click can never panic.
+    pub fn select(&mut self, index: usize) {
+        if index < self.sessions.len() {
+            self.active = index;
+        }
+    }
+
+    /// Drop the active session's rendered output, keeping the session (and
+    /// its tab) itself.
+    pub fn clear_active(&mut self) {
+        if let Some(session) = self.sessions.get_mut(self.active) {
+            session.lines.clear();
+        }
+    }
+
+    /// Plain text of the active session (for clipboard / save).
+    pub fn active_text(&self) -> Option<String> {
+        self.active_session().map(|s| {
+            s.lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
+    pub fn push_event(&mut self, event: StreamEvent) {
+        let Some(session) = self.sessions.get_mut(self.active) else {
+            return;
+        };
+        match event {
+            StreamEvent::Stdout(text) => session.feed(Stream::Stdout, &text),
+            StreamEvent::Stderr(text) => session.feed(Stream::Stderr, &text),
+            StreamEvent::Exited(0) => session.status = RunStatus::Succeeded,
+            StreamEvent::Exited(code) => session.status = RunStatus::Failed(code),
+        }
+    }
+}
+
+/// Remove ANSI escape sequences (CSI and OSC forms) from process output.
+pub fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            None => break,
+            // CSI: parameters/intermediates up to a final byte 0x40–0x7E.
+            Some('[') => {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('\x40'..='\x7e').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            // OSC: string terminated by BEL or ESC \ (ST).
+            Some(']') => {
+                chars.next();
+                let mut prev_esc = false;
+                for t in chars.by_ref() {
+                    if t == '\x07' || (prev_esc && t == '\\') {
+                        break;
+                    }
+                    prev_esc = t == '\x1b';
+                }
+            }
+            // Single-character escape: consume the next char.
+            Some(_) => {
+                chars.next();
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner;
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            Ok(CommandOutput {
+                code: 0,
+                stdout: "{}".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Records the exact argv of every streamed `mise` invocation so the
+    /// UI-layer install contract (`install <tool>@<version>`) is pinned.
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn recording_mise() -> (Mise, Arc<Mutex<Vec<Vec<String>>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mise::new(
+                "mise".into(),
+                Arc::new(RecordingRunner),
+                Arc::new(RecordingStreamer { seen: seen.clone() }),
+            ),
+            seen,
+        )
+    }
+
+    #[test]
+    fn start_install_pins_install_argv_for_current_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(root.clone());
+
+        state.start_install("ripgrep", "14.1.0").unwrap();
+
+        // AGENTS.md rule 2: `-C <dir>` comes first, then the subcommand.
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root,
+                "install".to_string(),
+                "ripgrep@14.1.0".to_string(),
+            ]
+        );
+        // The session opened for this run flows into the terminal panel.
+        assert!(state.terminal.visible);
+        assert_eq!(state.terminal.sessions.len(), 1);
+        assert_eq!(state.terminal.sessions[0].title, "install ripgrep@14.1.0");
+        // Install never activates: state keeps the version so the UI can
+        // render 「已安装 · 未生效」 (rule 4).
+        state.installed = Loadable::Ready(vec![mise_core::ToolRow {
+            name: "ripgrep".into(),
+            version: "14.1.0".into(),
+            requested_version: None,
+            scope: mise_core::Scope::Global,
+            active: false,
+            install_path: None,
+            source_path: None,
+        }]);
+        assert_eq!(
+            state.installed_but_not_active("ripgrep"),
+            Some("14.1.0".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use mise_core::StreamEvent;
+
+    #[test]
+    fn appends_lines_in_order_and_sets_status() {
+        let mut term = TerminalState::default();
+        term.begin("install ripgrep@14.1.0");
+        term.push_event(StreamEvent::Stdout("downloading".into()));
+        term.push_event(StreamEvent::Stderr("warning".into()));
+        term.push_event(StreamEvent::Exited(0));
+        let session = term.active_session().unwrap();
+        assert_eq!(session.lines.len(), 2);
+        assert_eq!(session.lines[0].text, "downloading");
+        assert_eq!(session.lines[0].stream, Stream::Stdout);
+        assert_eq!(session.lines[1].text, "warning");
+        assert_eq!(session.lines[1].stream, Stream::Stderr);
+        assert!(matches!(session.status, RunStatus::Succeeded));
+    }
+
+    #[test]
+    fn non_zero_exit_marks_failure() {
+        let mut term = TerminalState::default();
+        term.begin("install x");
+        term.push_event(StreamEvent::Exited(1));
+        assert!(matches!(
+            term.active_session().unwrap().status,
+            RunStatus::Failed(1)
+        ));
+    }
+
+    /// `begin` must open a NEW session, focus it and show the panel again —
+    /// a second install must not append into the first run's tab.
+    #[test]
+    fn begin_creates_new_active_session_and_shows_panel() {
+        let mut term = TerminalState::default();
+        assert!(!term.visible);
+        let first = term.begin("install a@1");
+        term.push_event(StreamEvent::Stdout("one".into()));
+        let second = term.begin("install b@2");
+        term.push_event(StreamEvent::Stdout("two".into()));
+
+        assert_ne!(first, second);
+        assert!(term.visible);
+        assert_eq!(term.sessions.len(), 2);
+        let session = term.active_session().unwrap();
+        assert_eq!(session.id, second);
+        assert_eq!(session.title, "install b@2");
+        assert_eq!(session.lines.len(), 1);
+        assert_eq!(session.lines[0].text, "two");
+    }
+
+    /// AGENTS.md rule 9: events may arrive before any session exists
+    /// (spawn failure racing the panel) — never panic.
+    #[test]
+    fn push_event_without_session_is_noop() {
+        let mut term = TerminalState::default();
+        term.push_event(StreamEvent::Stdout("orphan".into()));
+        term.push_event(StreamEvent::Exited(0));
+        assert!(term.active_session().is_none());
+    }
+
+    /// Program output arrives '\n'-terminated per event from the streamer.
+    #[test]
+    fn trailing_newline_does_not_create_empty_line() {
+        let mut term = TerminalState::default();
+        term.begin("install x");
+        term.push_event(StreamEvent::Stdout("line one\nline two\n".into()));
+        let session = term.active_session().unwrap();
+        assert_eq!(
+            session
+                .lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["line one", "line two"]
+        );
+    }
+
+    /// A carriage-return progress update rewrites the tail instead of
+    /// appending a new line.
+    #[test]
+    fn carriage_return_rewrites_partial_line() {
+        let mut term = TerminalState::default();
+        term.begin("install x");
+        term.push_event(StreamEvent::Stdout("downloading  10%".into()));
+        term.push_event(StreamEvent::Stdout("downloading  50%\rdone!".into()));
+        let session = term.active_session().unwrap();
+        assert_eq!(session.lines.len(), 1);
+        assert_eq!(session.lines[0].text, "done!");
+    }
+
+    /// Red line: install output must never show raw escape codes.
+    #[test]
+    fn ansi_escape_sequences_are_stripped() {
+        assert_eq!(strip_ansi("\x1b[1;32mgreen\x1b[0m"), "green");
+        assert_eq!(strip_ansi("\x1b[2K\x1b[1Gprogress"), "progress");
+        assert_eq!(strip_ansi("\x1b]0;title\x07plain"), "plain");
+        assert_eq!(strip_ansi("no escapes"), "no escapes");
     }
 }
 
@@ -288,7 +703,7 @@ mod registry_load_tests {
     fn ensure_registry_runs_registry_json_once_and_is_cached() {
         let (mise, seen) = recording_mise(r#"[{"short":"node"}]"#);
         let mut state = AppState::new(ProjectStore::default());
-        state.mise = Some(mise);
+        state.mise = Some(Arc::new(mise));
 
         state.ensure_registry().unwrap();
         // Calling again after success must not re-run the subprocess.
@@ -307,7 +722,7 @@ mod registry_load_tests {
     fn failed_registry_load_leaves_failed_state() {
         let (mise, _seen) = recording_mise("this is not json");
         let mut state = AppState::new(ProjectStore::default());
-        state.mise = Some(mise);
+        state.mise = Some(Arc::new(mise));
 
         assert!(state.ensure_registry().is_err());
         assert!(matches!(state.registry, Loadable::Failed(_)));
@@ -516,7 +931,7 @@ mod refresh_tests {
 
         let (mise, seen) = recording_mise("{}");
         let mut state = AppState::new(projects);
-        state.mise = Some(mise);
+        state.mise = Some(Arc::new(mise));
         state.selection = Selection::ProjectTools(id.clone());
         state.refresh_installed().unwrap();
 
@@ -531,7 +946,7 @@ mod refresh_tests {
     fn refresh_installed_omits_project_root_for_global() {
         let (mise, seen) = recording_mise("{}");
         let mut state = AppState::new(ProjectStore::default());
-        state.mise = Some(mise);
+        state.mise = Some(Arc::new(mise));
         state.selection = Selection::GlobalTools;
         state.refresh_installed().unwrap();
 

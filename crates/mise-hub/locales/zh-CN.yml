@@ -47,7 +47,23 @@ discover:
   installed: 已安装
   install: 安装
   versions: 可用版本
+  pick_tool: 选择一个工具查看可用版本
+  installed_not_active: 已安装 · 未生效
+  installed_at_version: 已安装版本
+  apply_project: 应用到本项目
+  apply_global: 应用到全局
+  apply_m2_note: 本里程碑暂未实现，M2 将提供 mise use
+  loading_versions: 正在加载版本…
+  versions_failed: 加载版本失败
+  versions_unavailable: mise 不可用
 terminal:
   save: 保存
   copy: 复制
   clear: 清除
+  save_note: 将本次运行输出保存为日志文件
+  clear_keeps_tab: 清除输出但保留该运行标签页
+  running: 运行中
+  succeeded: 成功
+  failed: 失败
+  expand: 展开终端
+  collapse: 收起
