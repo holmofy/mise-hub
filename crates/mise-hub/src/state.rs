@@ -61,6 +61,27 @@ impl AppState {
             selected_tool: None,
         }
     }
+
+    pub fn attach_mise(&mut self, program: std::path::PathBuf) -> bool {
+        if !program.is_file() {
+            return false;
+        }
+        let mise = Mise::new(
+            program,
+            std::sync::Arc::new(mise_core::ProcessRunner),
+            std::sync::Arc::new(mise_core::ProcessStreamer),
+        );
+        self.mise_version = mise.version().ok();
+        self.mise = Some(mise);
+        true
+    }
+
+    pub fn detect(&mut self) -> bool {
+        match mise_core::locate_mise() {
+            Some(path) => self.attach_mise(path),
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -79,5 +100,18 @@ mod tests {
         let l: Loadable<u32> = Loadable::Ready(3);
         assert_eq!(l.ready(), Some(&3));
         assert_eq!(Loadable::<u32>::Idle.ready(), None);
+    }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+
+    #[test]
+    fn detect_without_mise_leaves_state_empty() {
+        let mut state = AppState::new(ProjectStore::default());
+        // 用一个确定不存在的路径模拟未安装
+        assert!(!state.attach_mise(std::path::PathBuf::from("/nonexistent/mise")));
+        assert!(state.mise.is_none());
     }
 }

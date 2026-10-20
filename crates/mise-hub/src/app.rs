@@ -1,7 +1,7 @@
 use crate::i18n;
 use crate::state::AppState;
 use crate::theme;
-use crate::views::sidebar;
+use crate::views::{setup, sidebar};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::StyledExt;
@@ -30,8 +30,10 @@ impl RootView {
     ) -> Self {
         let path = mise_core::default_store_path();
         let projects = mise_core::ProjectStore::load(&path).unwrap_or_default();
+        let mut state = AppState::new(projects);
+        state.detect();
         Self {
-            state: AppState::new(projects),
+            state,
             settings,
             settings_path,
         }
@@ -48,6 +50,14 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.state.mise.is_none() {
+            let on_detect = cx.listener(|this, _event, _window, cx| {
+                this.state.detect();
+                cx.notify();
+            });
+            return setup::render(on_detect).into_any_element();
+        }
+
         let theme_names = theme::theme_names(cx);
         let current_theme = self.settings.theme.clone();
         let current_locale = self.settings.locale.clone();
@@ -156,5 +166,6 @@ impl Render for RootView {
                             .child(format!("{:?}", self.state.selection)),
                     ),
             )
+            .into_any_element()
     }
 }
