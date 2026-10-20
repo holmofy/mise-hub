@@ -7,11 +7,13 @@ pub mod project;
 pub mod remote;
 pub mod runner;
 pub mod search;
+pub mod settings;
 pub mod tools;
 pub mod types;
 
 pub use error::CoreError;
 pub use mise::Mise;
+pub use settings::{default_settings_path, AppSettings};
 pub use locator::{default_candidates, locate_in, locate_mise};
 pub use registry::parse_registry;
 pub use project::{default_store_path, Project, ProjectStore};

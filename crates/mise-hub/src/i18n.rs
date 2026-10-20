@@ -4,12 +4,20 @@
 //! `main.rs`: its generated lookup machinery (`_rust_i18n_t!`, the backend, and
 //! the `_rust_i18n_*` helpers) is emitted with `crate::`-relative paths, so it
 //! must live at the crate root for `t!` to resolve. This module keeps the
-//! runtime entry point (and, in Task 9, the user-facing locale handling).
+//! runtime entry point and the user-facing locale handling.
 
 /// Initialize the internationalization layer for the application.
 ///
-/// Task 9 will drive this from user settings; for now the application always
-/// starts in English.
+/// Called once at startup with the locale loaded from settings. Later changes
+/// go through [`set_locale`].
 pub fn init(locale: &str) {
+    rust_i18n::set_locale(locale);
+}
+
+/// Switch the active locale at runtime.
+///
+/// Text rendered with `t!` is resolved at render time, so callers should
+/// re-render (e.g. `cx.notify()`) after switching.
+pub fn set_locale(locale: &str) {
     rust_i18n::set_locale(locale);
 }

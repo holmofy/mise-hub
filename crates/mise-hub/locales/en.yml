@@ -1,3 +1,5 @@
+app:
+  name: mise-hub
 nav:
   workbench: Workbench
   discover: Discover
@@ -5,3 +7,20 @@ nav:
   tasks: Tasks
   env: Environment
   projects: Projects
+setup:
+  title: mise is not installed
+  body: mise-hub needs the mise CLI. Install it, then click Detect again.
+  detect: Detect again
+tools:
+  search_installed: Search installed tools
+  all: All
+  project: This project
+  global: Global
+discover:
+  search: Search tools (English keywords)
+  install: Install
+  versions: Versions
+terminal:
+  save: Save
+  copy: Copy
+  clear: Clear

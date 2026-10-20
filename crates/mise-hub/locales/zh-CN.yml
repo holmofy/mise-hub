@@ -1,3 +1,5 @@
+app:
+  name: mise-hub
 nav:
   workbench: 工作台
   discover: 发现
@@ -5,3 +7,20 @@ nav:
   tasks: 任务
   env: 环境
   projects: 项目
+setup:
+  title: 尚未安装 mise
+  body: mise-hub 需要 mise 命令行工具。安装后点击「重新检测」。
+  detect: 重新检测
+tools:
+  search_installed: 搜索已安装的工具
+  all: 全部
+  project: 本项目
+  global: 全局
+discover:
+  search: 搜索工具（英文关键词）
+  install: 安装
+  versions: 可用版本
+terminal:
+  save: 保存
+  copy: 复制
+  clear: 清除
