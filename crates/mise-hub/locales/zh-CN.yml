@@ -7,6 +7,12 @@ nav:
   tasks: 任务
   env: 环境
   projects: 项目
+  add_project: 添加项目
+  remove_project: 移除项目
+  confirm_remove_title: 移除项目
+  confirm_remove_body: 从列表中移除该项目？磁盘上的文件夹不会被改动。
+  cancel: 取消
+  remove: 移除
 setup:
   title: 尚未安装 mise
   body: mise-hub 需要 mise 命令行工具。安装后点击「重新检测」。
@@ -16,6 +22,19 @@ tools:
   all: 全部
   project: 本项目
   global: 全局
+  version: 版本
+  scope: 范围
+  source: 来源
+  install_path: 安装路径
+  active: 生效
+  inactive: 未生效
+  overridden: 已覆盖
+  apply: 应用版本
+  apply_m2_note: 本里程碑暂未实现，M2 将提供版本应用
+  empty: 暂无已安装的工具
+  loading: 加载中…
+  failed: 加载工具失败
+  select_tool: 选择一个工具
 discover:
   search: 搜索工具（英文关键词）
   install: 安装

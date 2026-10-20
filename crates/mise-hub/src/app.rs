@@ -1,14 +1,17 @@
 use crate::i18n;
-use crate::state::AppState;
+use crate::state::{AppState, Loadable, Selection};
 use crate::theme;
-use crate::views::{setup, sidebar};
+use crate::views::{setup, sidebar, tool_detail, tool_list};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::StyledExt;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::WindowExt;
+use gpui_kit::component::button::{Button, ButtonVariant};
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use mise_core::AppSettings;
+use mise_core::{AppSettings, ScopeFilter, ToolRow};
 use rust_i18n::t;
 use std::path::PathBuf;
 
@@ -19,12 +22,17 @@ pub struct RootView {
     pub state: AppState,
     pub settings: AppSettings,
     pub settings_path: PathBuf,
+    pub projects_collapsed: bool,
+    pub tool_filter: ScopeFilter,
+    pub search_input: Entity<InputState>,
+    pub notice: Option<String>,
+    _search_subscription: Subscription,
 }
 
 impl RootView {
     pub fn new(
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
         settings: AppSettings,
         settings_path: PathBuf,
     ) -> Self {
@@ -32,11 +40,30 @@ impl RootView {
         let projects = mise_core::ProjectStore::load(&path).unwrap_or_default();
         let mut state = AppState::new(projects);
         state.detect();
-        Self {
+        state.ensure_registry();
+
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("tools.search_installed").to_string())
+        });
+        let search_subscription =
+            cx.subscribe(&search_input, |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            });
+
+        let mut this = Self {
             state,
             settings,
             settings_path,
-        }
+            projects_collapsed: false,
+            tool_filter: ScopeFilter::All,
+            search_input,
+            notice: None,
+            _search_subscription: search_subscription,
+        };
+        this.refresh_installed();
+        this
     }
 
     fn locale_label(code: &str) -> &'static str {
@@ -46,6 +73,179 @@ impl RootView {
             .map(|(_, label)| *label)
             .unwrap_or("English")
     }
+
+    /// Change the current selection, resetting per-page state and refreshing
+    /// installed tools when navigating to a tools page.
+    pub(crate) fn select(&mut self, sel: Selection, cx: &mut Context<Self>) {
+        self.state.selection = sel;
+        self.state.selected_tool = None;
+        self.tool_filter = ScopeFilter::All;
+        self.notice = None;
+        if self.is_tools_page() {
+            self.refresh_installed();
+        }
+        cx.notify();
+    }
+
+    fn is_tools_page(&self) -> bool {
+        matches!(
+            self.state.selection,
+            Selection::GlobalTools | Selection::ProjectTools(_)
+        )
+    }
+
+    /// Refresh installed tools, storing failures on the `installed` Loadable.
+    fn refresh_installed(&mut self) {
+        match self.state.refresh_installed() {
+            Ok(()) => {}
+            Err(e) => self.state.installed = Loadable::Failed(e.to_string()),
+        }
+    }
+
+    /// Open a folder picker and add the chosen folder as a project, then select
+    /// that project's tools page.
+    pub(crate) fn prompt_add_project(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            // rfd's sync dialog runs a nested event loop on the main thread;
+            // the foreground executor runs this task on the main thread.
+            let picked = rfd::FileDialog::new().pick_folder();
+            let Some(path) = picked else { return };
+            let id = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .into_owned();
+            this.update(cx, |this, cx| match this.state.add_project(&path) {
+                Ok(()) => this.select(Selection::ProjectTools(id), cx),
+                Err(e) => this.notice = Some(e.to_string()),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ask for confirmation, then remove a project from the store.
+    pub(crate) fn prompt_remove_project(
+        &mut self,
+        id: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            // The dialog builder may run again on rebuild, so clone into the
+            // per-build `on_ok` closure instead of moving out of this one.
+            let weak = weak.clone();
+            let id = id.clone();
+            let name = name.clone();
+            alert
+                .confirm()
+                .title(t!("nav.confirm_remove_title").to_string())
+                .description(format!("{} — {}", name, t!("nav.confirm_remove_body")))
+                .ok_text(t!("nav.remove").to_string())
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text(t!("nav.cancel").to_string())
+                .on_ok(move |_, _, cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |this, cx| {
+                            this.state.remove_project(&id);
+                            this.notice = None;
+                            cx.notify();
+                        });
+                    }
+                    true
+                })
+        });
+    }
+
+    fn tools_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (filter, show_filter) = match &self.state.selection {
+            Selection::GlobalTools => (ScopeFilter::All, false),
+            Selection::ProjectTools(_) => (self.tool_filter, true),
+            _ => (ScopeFilter::All, false),
+        };
+
+        let search_query = self.search_input.read(cx).value().to_string();
+        let all_rows = self.state.rows(filter);
+        let rows: Vec<ToolRow> = if search_query.is_empty() {
+            all_rows
+        } else {
+            let q = search_query.to_lowercase();
+            all_rows
+                .into_iter()
+                .filter(|r| {
+                    r.name.to_lowercase().contains(&q) || r.version.to_lowercase().contains(&q)
+                })
+                .collect()
+        };
+
+        let selected_key = self.state.selected_tool.clone();
+        let selected_row = selected_key
+            .as_ref()
+            .and_then(|key| rows.iter().find(|r| &tool_list::row_key(r) == key))
+            .cloned();
+
+        let load_error = match &self.state.installed {
+            Loadable::Failed(err) => Some(err.as_str()),
+            _ => None,
+        };
+        let list = tool_list::render(
+            cx,
+            &self.search_input,
+            rows,
+            selected_key.as_deref(),
+            filter,
+            show_filter,
+            load_error,
+        );
+        let detail = match &selected_row {
+            Some(row) => tool_detail::render(row, cx).into_any_element(),
+            None => placeholder_detail(cx).into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .when_some(self.notice.clone(), |d, msg| {
+                d.child(notice_banner(cx, &msg))
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .child(detail),
+            )
+    }
+}
+
+fn placeholder_detail(cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .flex_1()
+        .h_full()
+        .items_center()
+        .justify_center()
+        .text_color(theme.muted_foreground)
+        .text_sm()
+        .child(t!("tools.select_tool").to_string())
+}
+
+fn notice_banner(cx: &App, msg: &str) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .w_full()
+        .px_3()
+        .py_2()
+        .text_sm()
+        .text_color(theme.danger)
+        .bg(theme.danger.opacity(0.1))
+        .child(msg.to_string())
 }
 
 impl Render for RootView {
@@ -131,6 +331,18 @@ impl Render for RootView {
                 })
         };
 
+        let right_pane = match &self.state.selection {
+            Selection::GlobalTools | Selection::ProjectTools(_) => {
+                self.tools_pane(cx).into_any_element()
+            }
+            other => div()
+                .flex_1()
+                .h_full()
+                .p_4()
+                .child(format!("{:?}", other))
+                .into_any_element(),
+        };
+
         div()
             .flex()
             .flex_col()
@@ -146,9 +358,18 @@ impl Render for RootView {
                     .py_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().text_sm().font_semibold().child(t!("app.name").to_string()))
                     .child(
-                        div().h_flex().gap_2().child(language_picker).child(theme_picker),
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("app.name").to_string()),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(language_picker)
+                            .child(theme_picker),
                     ),
             )
             .child(
@@ -157,14 +378,13 @@ impl Render for RootView {
                     .flex_row()
                     .flex_1()
                     .min_h_0()
-                    .child(sidebar::render(&self.state, cx))
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .p_4()
-                            .child(format!("{:?}", self.state.selection)),
-                    ),
+                    .child(sidebar::render(
+                        cx,
+                        &self.state.projects.projects,
+                        &self.state.selection,
+                        self.projects_collapsed,
+                    ))
+                    .child(right_pane),
             )
             .into_any_element()
     }

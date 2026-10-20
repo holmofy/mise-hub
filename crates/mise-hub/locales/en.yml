@@ -7,6 +7,12 @@ nav:
   tasks: Tasks
   env: Environment
   projects: Projects
+  add_project: Add project
+  remove_project: Remove project
+  confirm_remove_title: Remove project
+  confirm_remove_body: Remove this project from the list? The folder on disk is not touched.
+  cancel: Cancel
+  remove: Remove
 setup:
   title: mise is not installed
   body: mise-hub needs the mise CLI. Install it, then click Detect again.
@@ -16,6 +22,19 @@ tools:
   all: All
   project: This project
   global: Global
+  version: Version
+  scope: Scope
+  source: Source
+  install_path: Install path
+  active: Active
+  inactive: Inactive
+  overridden: Overridden
+  apply: Apply version
+  apply_m2_note: Not available yet — applying a version is planned for M2
+  empty: No installed tools
+  loading: Loading…
+  failed: Failed to load tools
+  select_tool: Select a tool
 discover:
   search: Search tools (English keywords)
   install: Install
