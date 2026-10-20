@@ -38,6 +38,13 @@ tools:
   select_tool: 选择一个工具
 discover:
   search: 搜索工具（英文关键词）
+  search_note: 本地搜索仅匹配英文关键词；「深度搜索」需联网执行 mise search --all，本里程碑未实现。
+  deep_search: 深度搜索
+  deep_search_note: mise search --all 需联网，M2 提供——本里程碑未实现
+  no_results: 没有匹配此查询的工具
+  loading: 正在加载工具索引…
+  failed: 加载工具索引失败
+  installed: 已安装
   install: 安装
   versions: 可用版本
 terminal:

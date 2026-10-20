@@ -1,3 +1,4 @@
+pub mod discover;
 pub mod setup;
 pub mod sidebar;
 pub mod tool_detail;

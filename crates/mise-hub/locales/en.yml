@@ -38,6 +38,13 @@ tools:
   select_tool: Select a tool
 discover:
   search: Search tools (English keywords)
+  search_note: Local search matches English keywords only. Deep search (mise search --all, online) is not implemented until M2.
+  deep_search: Deep search
+  deep_search_note: mise search --all is online and ships in M2 — not implemented yet
+  no_results: No tools match this query
+  loading: Loading tool registry…
+  failed: Failed to load the tool registry
+  installed: Installed
   install: Install
   versions: Versions
 terminal:

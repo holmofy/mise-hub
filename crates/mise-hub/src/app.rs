@@ -1,18 +1,20 @@
 use crate::i18n;
 use crate::state::{AppState, Loadable, Selection};
 use crate::theme;
-use crate::views::{setup, sidebar, tool_detail, tool_list};
+use crate::views::{discover, setup, sidebar, tool_detail, tool_list};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::StyledExt;
+use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::component::WindowExt;
 use gpui_kit::component::button::{Button, ButtonVariant};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use mise_core::{AppSettings, ScopeFilter, ToolRow};
+use mise_core::{AppSettings, ScopeFilter, SearchHit, ToolRow};
 use rust_i18n::t;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// Locale choices exposed by the language picker: (locale code, display label).
@@ -25,8 +27,23 @@ pub struct RootView {
     pub projects_collapsed: bool,
     pub tool_filter: ScopeFilter,
     pub search_input: Entity<InputState>,
+    /// Discover-page query input; separate from the tools-page input because
+    /// the two search boxes filter different lists (with different
+    /// placeholders) but can keep their own text while switching pages.
+    pub discover_input: Entity<InputState>,
+    /// Search results for the discover page, refreshed once per render (query
+    /// change or selection change). The virtual-list closure only slices this
+    /// vec, so scrolling never re-runs the search.
+    pub discover_hits: Vec<SearchHit>,
+    /// Track the last discover query to reset the scroll position on a new
+    /// query only (not on every unrelated re-render).
+    discover_last_query: String,
+    /// Scroll position of the discover list, kept on the view so re-renders
+    /// (keystrokes) do not jump the list back to the top.
+    pub discover_scroll: VirtualListScrollHandle,
     pub notice: Option<String>,
     _search_subscription: Subscription,
+    _discover_subscription: Subscription,
 }
 
 impl RootView {
@@ -40,13 +57,26 @@ impl RootView {
         let projects = mise_core::ProjectStore::load(&path).unwrap_or_default();
         let mut state = AppState::new(projects).with_store_path(path.clone());
         state.detect();
-        state.ensure_registry();
+        // Load the tool registry up front (blocking, like `refresh_installed`
+        // below). A failure is stored on `state.registry` and rendered by the
+        // discover page with the raw error, so it never becomes a blank page
+        // (AGENTS.md rule 9).
+        let _ = state.ensure_registry();
 
         let search_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("tools.search_installed").to_string())
         });
         let search_subscription =
             cx.subscribe(&search_input, |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            });
+
+        let discover_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("discover.search").to_string()));
+        let discover_subscription =
+            cx.subscribe(&discover_input, |_this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
                 }
@@ -59,8 +89,13 @@ impl RootView {
             projects_collapsed: false,
             tool_filter: ScopeFilter::All,
             search_input,
+            discover_input,
+            discover_hits: Vec::new(),
+            discover_last_query: String::new(),
+            discover_scroll: VirtualListScrollHandle::new(),
             notice: None,
             _search_subscription: search_subscription,
+            _discover_subscription: discover_subscription,
         };
         // Mark the installed list as loading before the (synchronous) refresh
         // so a slow `mise ls` reads as "loading", not as "no tools installed".
@@ -106,6 +141,37 @@ impl RootView {
             Ok(()) => {}
             Err(e) => self.state.installed = Loadable::Failed(e.to_string()),
         }
+    }
+
+    /// Compute the discover-page search/browse results once per render. The
+    /// virtual list only slices `discover_hits` afterwards, so scrolling does
+    /// not re-run the search, and the index itself is cached in `AppState`
+    /// (built once when the registry loaded).
+    fn discover_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.discover_input.read(cx).value().to_string();
+        // A new query starts the list at the top; unrelated re-renders keep
+        // the scroll position.
+        if query != self.discover_last_query {
+            self.discover_last_query = query.clone();
+            self.discover_scroll.set_offset(point(px(0.), px(0.)));
+        }
+        // No limit: browse mode (empty query) must show the whole registry.
+        self.discover_hits = self.state.search(&query, usize::MAX);
+
+        let installed_names: HashSet<String> = self
+            .state
+            .installed
+            .ready()
+            .map(|rows| rows.iter().map(|r| r.name.clone()).collect())
+            .unwrap_or_default();
+        discover::render(
+            cx,
+            &self.discover_input,
+            &self.discover_hits,
+            &installed_names,
+            &self.discover_scroll,
+            &self.state.registry,
+        )
     }
 
     /// Open a folder picker and add the chosen folder as a project, then select
@@ -251,6 +317,10 @@ impl Render for RootView {
         if self.state.mise.is_none() {
             let on_detect = cx.listener(|this, _event, _window, cx| {
                 this.state.detect();
+                // mise may have appeared only now (setup page path): the
+                // startup load was a no-op back then. Failures stay in
+                // `state.registry` and surface on the discover page.
+                let _ = this.state.ensure_registry();
                 // Refresh now that mise may be present; otherwise the tools
                 // page would sit on the startup `Loading` marker forever.
                 this.refresh_installed();
@@ -336,6 +406,7 @@ impl Render for RootView {
             Selection::GlobalTools | Selection::ProjectTools(_) => {
                 self.tools_pane(cx).into_any_element()
             }
+            Selection::Discover => self.discover_pane(cx).into_any_element(),
             _ => div()
                 .flex_1()
                 .h_full()
