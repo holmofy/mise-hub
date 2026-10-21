@@ -180,11 +180,19 @@ env:
   show_all: Show all values
   hide_all: Hide all values
   redact_note: >-
-    Values are hidden by default; the mise CLI has no redact flag, so
-    hiding/showing is a display behavior of this page only.
+    mise masks redact = true declarations by default; this app reads the raw
+    values via "mise set --no-redact" but keeps them masked on this page.
+    Show / hide is a display behavior of this page only.
   ambiguous: value may be inaccurate — show it for the exact read
   exact_loading: Reading exact value (mise set NAME)…
   exact_failed: Exact read failed
+  copy_redacted_warn: >-
+    This value is redacted by mise; only an exact re-read produces the real
+    value.
+  edit_refuse_ambiguous: >-
+    This value could not be read exactly yet — the edit is refused so a
+    misread value cannot be written back. Click edit again once the exact
+    read has finished.
   also_effective: declared · active
   chain_other: other scope declaration
   chain_effective: effective value

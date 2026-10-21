@@ -175,10 +175,14 @@ env:
   show_all: 显示全部
   hide_all: 隐藏全部
   redact_note: >-
-    变量值默认隐藏；mise CLI 没有 redact 参数，隐藏 / 显示只是本页的显示行为。
+    mise 默认会对 redact = true 的声明打码；本应用通过 "mise set --no-redact"
+    读取原始值，但在此页保持遮蔽显示。显示 / 隐藏只是本页的显示行为。
   ambiguous: 该值可能不准确 — 点击显示查看准确值
   exact_loading: 正在读取准确值（mise set NAME）…
   exact_failed: 读取准确值失败
+  copy_redacted_warn: 该值被 mise 打码，只有精确重读后才能得到真实值。
+  edit_refuse_ambiguous: >-
+    尚未读到该值的精确内容，编辑被拒绝，以免把误读的值写回配置。等精确读取完成后再点击编辑。
   also_effective: 已声明 · 已生效
   chain_other: 另一范围声明
   chain_effective: 生效值

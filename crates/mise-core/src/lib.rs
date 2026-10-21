@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod env;
 pub mod error;
 pub mod install;
@@ -15,8 +16,10 @@ pub mod tasks;
 pub mod tools;
 pub mod types;
 
+pub use backup::{backup_file, default_backup_dir, global_config_path};
 pub use env::{
-    EnvDeclaration, EnvVar, is_declared, parse_env_extended, parse_set_list, path_segments,
+    EnvDeclaration, EnvVar, is_declared, is_redacted, parse_env_extended, parse_set_list,
+    path_segments,
 };
 pub use error::CoreError;
 pub use install::{ProcessStreamer, StreamEvent, StreamingRunner};

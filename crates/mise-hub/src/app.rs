@@ -1187,6 +1187,13 @@ impl RootView {
         show_all: bool,
         cx: &mut Context<Self>,
     ) {
+        // mise's `[redacted]` placeholder is never a real value (states
+        // truthfully rather than planting the literal text in the clipboard).
+        if mise_core::is_redacted(raw) {
+            self.notice = Some(t!("env.copy_redacted_warn").to_string());
+            cx.notify();
+            return;
+        }
         if !env::copy_allowed(show_all, &self.env_revealed, name) {
             self.notice = Some(t!("env.copy_hidden_warn").to_string());
             cx.notify();
@@ -1209,12 +1216,42 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         let prefilled: Option<String> = editing.clone().and_then(|name| {
-            self.state.env_declarations.ready().and_then(|rows| {
-                rows.iter()
-                    .find(|d| d.name == name)
-                    .map(|d| d.value.clone())
-            })
+            let decl = self
+                .state
+                .env_declarations
+                .ready()
+                .and_then(|rows| rows.iter().find(|d| d.name == name))?;
+            // The parsed value is only a safe starting point when the row's
+            // layout was recovered with certainty and the value is not mise's
+            // `[redacted]` placeholder; ambiguous/redacted rows use the exact
+            // `mise set NAME` re-read, or refuse the edit when it has not
+            // landed (confirming the parsed value would write corrupted
+            // text back — Fix C of the whole-branch review).
+            let exact = self.state.env_exact.get(&name).and_then(|s| match s {
+                Loadable::Ready(v) => Some(v.as_str()),
+                _ => None,
+            });
+            match env::edit_prefill(exact, decl) {
+                env::Prefill::Declared(value) | env::Prefill::Exact(value) => Some(value),
+                env::Prefill::Refuse => None,
+            }
         });
+        // Refusal closes the requested edit with a clear notice — AND starts
+        // the exact read so a second click (once it resolves) succeeds.
+        let refuses_edit = editing.is_some()
+            && prefilled.is_none()
+            && self.state.env_declarations.ready().is_some_and(|rows| {
+                editing
+                    .as_deref()
+                    .is_some_and(|n| rows.iter().any(|d| d.name == n))
+            });
+        if refuses_edit {
+            let name = editing.clone().unwrap();
+            self.notice = Some(t!("env.edit_refuse_ambiguous").to_string());
+            self.load_env_exact(name, cx);
+            cx.notify();
+            return;
+        }
         // The edited declaration's own file: the write targets THIS file
         // (`mise set --file`), not the page's default scope file.
         let editing_source: Option<String> = editing.as_deref().and_then(|name| {
@@ -1714,6 +1751,14 @@ impl RootView {
     /// `env::render` (no re-entrant reads mid-layout).
     fn env_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let filter_text = self.env_filter_input.read(cx).value().to_string();
+        // Snapshots read off `self.state` up front: the view builders must
+        // never call `cx.entity().read(cx)` during render (the view entity
+        // is leased out then — a second read panics).
+        let project_in_context = self.state.selection.project_id().is_some();
+        let project_root = self
+            .state
+            .current_project_root()
+            .map(|p| p.to_string_lossy().into_owned());
         env::render(
             cx,
             self.env_tab,
@@ -1726,6 +1771,8 @@ impl RootView {
             &self.env_revealed,
             &self.env_expanded,
             &filter_text,
+            project_in_context,
+            project_root,
         )
     }
 
@@ -1791,6 +1838,9 @@ impl RootView {
                     .state
                     .outdated_from_current_scope()
                     .is_some_and(|list| list.iter().any(|t| t.name == row.name));
+                // Snapshot BEFORE the view builder: apply scope resolution
+                // must not read the view entity inside `tool_detail::render`.
+                let apply_global = self.state.current_project_root().is_none();
                 tool_detail::render(
                     cx,
                     row,
@@ -1800,6 +1850,7 @@ impl RootView {
                     self.state.is_busy("use", &spec),
                     self.state.is_busy("uninstall", &spec),
                     self.state.is_busy("upgrade", &row.name),
+                    apply_global,
                 )
                 .into_any_element()
             }

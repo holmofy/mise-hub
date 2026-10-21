@@ -261,13 +261,16 @@ impl Mise {
     }
 
     /// Rows of the plain-text `mise set` listing (declarations only; no JSON
-    /// form exists). Ambiguous rows (value that looks like a path) should be
-    /// re-read via `env_value`.
+    /// form exists). `--no-redact` is required: mise redacts variables declared
+    /// with `redact = true` as the literal `[redacted]` by default, which
+    /// would otherwise destroy secrets when an ambiguous value is edited
+    /// back. Ambiguous rows (value that looks like a path) should be re-read
+    /// via `env_value`.
     pub fn env_declarations(
         &self,
         project_root: Option<&Path>,
     ) -> Result<Vec<EnvDeclaration>, CoreError> {
-        let out = self.run(&["set"], project_root)?;
+        let out = self.run(&["set", "--no-redact"], project_root)?;
         parse_set_list(&out.stdout)
     }
 
@@ -765,7 +768,12 @@ recursively searches directories ... https://github.com/BurntSushi/ripgrep\n";
     fn env_declarations_argv_and_parse() {
         let (m, seen, _) = mise_rec_stream("A  1  /proj/mise.toml\n");
         let rows = m.env_declarations(Some(Path::new("/proj"))).unwrap();
-        assert_eq!(seen.lock().unwrap()[0], vec!["-C", "/proj", "set"]);
+        // `--no-redact` is required: mise redacts `redact = true` variables
+        // by default, and the raw value is what declarations need.
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["-C", "/proj", "set", "--no-redact"]
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "A");
     }

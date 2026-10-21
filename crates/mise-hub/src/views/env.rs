@@ -2,10 +2,13 @@
 //! values, the three-column diff, PATH segmentation sources, and the
 //! add / edit / delete flows.
 //!
-//! Redaction: the 2026.10 mise CLI has NO redact flag for `mise set`, so
-//! hiding secrets happens ENTIRELY here — values render masked until the
-//! user reveals them, and copying is refused while a value stays hidden
-//! (the page carries a note stating exactly that).
+//! Redaction: mise redacts variables declared with `redact = true` as the
+//! literal `[redacted]` by DEFAULT (verified on 2026.10.15; `mise set
+//! --no-redact` lifts it, and core passes that flag when listing). Hiding
+//! secrets is therefore BOTH a data-layer flag (`--no-redact` requested,
+//! values re-read exactly) AND a display concern here — values render
+//! masked until the user reveals them, and copying is refused while a value
+//! stays hidden (the page carries a note stating exactly that).
 //!
 //! NOTE: this module deliberately avoids `use gpui_kit::*;` — the kit root
 //! re-exports gpui_macros' own `test` attribute which, combined with the
@@ -29,7 +32,7 @@ use gpui_kit::component::theme::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, ClickEvent, Context, Entity, SharedString, WeakEntity};
 use gpui_kit::{div, px};
-use mise_core::{EnvDeclaration, EnvVar, path_segments};
+use mise_core::{EnvDeclaration, EnvVar, is_redacted, path_segments};
 use rust_i18n::t;
 use std::collections::HashSet;
 use std::path::Path;
@@ -229,6 +232,19 @@ fn decl_pairs(rows: &[EnvDeclaration]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Declarations for diff comparison with `[redacted]` placeholder rows
+/// dropped: mise's redact placeholder is never a real value — treating it
+/// as data produced false conflicts (both columns looking unequal, or the
+/// effective value "differing" from a value that was never shown).
+fn diffable_declarations(rows: Option<&[EnvDeclaration]>) -> Option<Vec<EnvDeclaration>> {
+    rows.map(|rows| {
+        rows.iter()
+            .filter(|d| !is_redacted(&d.value))
+            .cloned()
+            .collect()
+    })
+}
+
 fn var_pairs(rows: &[EnvVar]) -> Vec<(String, String)> {
     rows.iter()
         .map(|v| (v.name.clone(), v.value.clone()))
@@ -250,8 +266,14 @@ pub fn compute_diff(
     project: Option<&[EnvDeclaration]>,
     effective: &[EnvVar],
 ) -> Vec<DiffRow> {
+    // `[redacted]` rows are placeholders, not data (see `diffable_declarations`).
+    let global = diffable_declarations(global);
+    let project = diffable_declarations(project);
     let mut names: Vec<String> = effective.iter().map(|v| v.name.clone()).collect();
-    for rows in [global, project].into_iter().flatten() {
+    for rows in [global.as_deref(), project.as_deref()]
+        .into_iter()
+        .flatten()
+    {
         names.extend(decl_pairs(rows).into_iter().map(|(n, _)| n));
     }
     names.sort();
@@ -262,8 +284,8 @@ pub fn compute_diff(
     names
         .into_iter()
         .map(|name| {
-            let val_global = lookup_pair(global.map(decl_pairs), &name);
-            let val_project = lookup_pair(project.map(decl_pairs), &name);
+            let val_global = lookup_pair(global.as_deref().map(decl_pairs), &name);
+            let val_project = lookup_pair(project.as_deref().map(decl_pairs), &name);
             let eff = lookup_pair(Some(effective_pairs.clone()), &name);
             // Both declared columns have data: any inequality between the
             // two declarations (absence included) differs.
@@ -314,6 +336,32 @@ fn display_value(value: &str, revealed: bool) -> String {
     }
 }
 
+/// What the 「编辑变量」 dialog's value input should be prefilled with.
+/// A parsed declaration value is only trustworthy when the row's layout
+/// was recovered with certainty AND the value is not mise's `[redacted]`
+/// placeholder; otherwise the EXACT re-read result is used, and when no
+/// exact value is available the edit is refused (confirming the parsed
+/// value would write the mangled / placeholder text back into the config).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prefill {
+    Declared(String),
+    Exact(String),
+    Refuse,
+}
+
+/// The pure decision. `exact` is the current scope's exact `mise set NAME`
+/// result when it is Ready (the literal placeholder still refuses).
+pub fn edit_prefill(exact: Option<&str>, decl: &EnvDeclaration) -> Prefill {
+    let usable = |v: &str| !decl.ambiguous && !is_redacted(v);
+    if usable(&decl.value) {
+        return Prefill::Declared(decl.value.clone());
+    }
+    match exact.filter(|v| !is_redacted(v)) {
+        Some(v) => Prefill::Exact(v.to_string()),
+        None => Prefill::Refuse,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Render path (no logic beyond i18n + layout)
 // ---------------------------------------------------------------------------
@@ -336,6 +384,11 @@ pub fn render(
     revealed: &HashSet<String>,
     expanded: &HashSet<String>,
     filter_text: &str,
+    // Snapshot by `env_pane` (which holds `&mut self`): reading these off
+    // the view entity here would re-enter `Entity::read` mid-layout and
+    // panic — the entity is leased out while this very render runs.
+    project_in_context: bool,
+    project_root: Option<String>,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
     let filter = filter_text.to_lowercase();
@@ -396,17 +449,10 @@ pub fn render(
     // project page that is (global=other listing, project=current listing);
     // on a global page the project column has no data at all and the diff
     // shows the neutral 「选择项目」 state instead.
-    let project_in_context = on_project_page(cx);
     let global_col: Option<Vec<EnvDeclaration>> = if project_in_context {
         other_declarations.ready().cloned()
     } else {
         declarations.ready().cloned()
-    };
-    let project_root: Option<String> = {
-        let view = cx.entity().read(cx);
-        view.state
-            .current_project_root()
-            .map(|p| p.to_string_lossy().into_owned())
     };
     let project_col: Option<Vec<EnvDeclaration>> = if project_in_context {
         // Blocker 4: the current-scope listing INCLUDES global declarations;
@@ -419,29 +465,50 @@ pub fn render(
         None
     };
 
+    // Config-provided PATH tokens: declarations of BOTH scopes feed the
+    // segment classifier (passed on into the PATH section below).
+    let mut config_tokens = HashSet::new();
+    for rows in [
+        declarations.ready().cloned(),
+        other_declarations.ready().cloned(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        config_tokens.extend(config_path_tokens(&rows));
+    }
+
     let body: AnyElement = match tab {
         EnvTab::Declarations => declarations_tab(
             cx,
             declarations,
             effective,
+            other_declarations,
             exact,
             show_all,
             revealed,
             expanded,
         )
         .into_any_element(),
-        EnvTab::Effective => {
-            effective_tab(cx, effective, filter_input, show_all, revealed, &filter)
-                .into_any_element()
-        }
+        EnvTab::Effective => effective_tab(
+            cx,
+            effective,
+            filter_input,
+            show_all,
+            revealed,
+            &filter,
+            &config_tokens,
+        )
+        .into_any_element(),
         EnvTab::Diff => {
             diff_tab(cx, global_col, project_col, effective, project_in_context).into_any_element()
         }
     };
     col = col.child(body);
 
-    // Sensitive-value policy note (the CLI has no redact flag — hiding is
-    // a display-time behavior only, which the page states).
+    // Sensitive-value policy note: mise redacts by default, the app
+    // re-reads values with --no-redact, and this page keeps the values
+    // masked — the note states exactly that.
     col = col.child(
         div()
             .text_xs()
@@ -450,12 +517,6 @@ pub fn render(
     );
 
     col
-}
-
-/// Whether an env PROJECT page is selected (the diff view's neutral third
-/// column state depends on it).
-fn on_project_page(cx: &Context<RootView>) -> bool {
-    cx.entity().read(cx).state.selection.project_id().is_some()
 }
 
 fn status_body(theme: &Theme, message: String) -> AnyElement {
@@ -508,10 +569,12 @@ fn failed_body(cx: &Context<RootView>, err: &str) -> AnyElement {
 /// Rows whose name is also effective are highlighted (declared AND active,
 /// spec §6.5); a revealed row expands its override chain (other scope's
 /// declaration + the effective value) — the two files we can see.
+#[allow(clippy::too_many_arguments)]
 fn declarations_tab(
     cx: &mut Context<RootView>,
     declarations: &Loadable<Vec<EnvDeclaration>>,
     effective: &Loadable<Vec<EnvVar>>,
+    other_declarations: &Loadable<Vec<EnvDeclaration>>,
     exact: &std::collections::HashMap<String, Loadable<String>>,
     show_all: bool,
     revealed: &HashSet<String>,
@@ -560,11 +623,25 @@ fn declarations_tab(
                         .into_any_element(),
                 );
                 for decl in rows {
+                    // The override chain's two extra values: the OTHER scope's
+                    // declaration of the name plus the effective value —
+                    // snapshotted from the passed-in loadables (no re-entrant
+                    // entity reads on the render path).
+                    let other = other_declarations
+                        .ready()
+                        .and_then(|list| list.iter().find(|d| d.name == decl.name).cloned());
+                    let eff_value = effective.ready().and_then(|list| {
+                        list.iter()
+                            .find(|v| v.name == decl.name)
+                            .map(|v| v.value.clone())
+                    });
                     list = list.child(
                         declaration_row(
                             cx,
                             &decl,
                             &effective_names,
+                            other,
+                            eff_value,
                             exact,
                             show_all,
                             revealed,
@@ -587,6 +664,8 @@ fn declaration_row(
     cx: &mut Context<RootView>,
     decl: &EnvDeclaration,
     effective_names: &HashSet<String>,
+    other: Option<EnvDeclaration>,
+    eff_value: Option<String>,
     exact: &std::collections::HashMap<String, Loadable<String>>,
     show_all: bool,
     revealed: &HashSet<String>,
@@ -595,16 +674,17 @@ fn declaration_row(
     let theme = cx.theme().clone();
     let mono = monospace_family();
     let name = decl.name.clone();
-    let revealed = is_revealed(show_all, revealed, &name);
-    let also_effective = effective_names.contains(&name);
-
     // The displayed value: an ambiguous row prefers the exact re-read once
     // it has landed; until then the parsed value renders (honestly marked).
     let raw_value = exact
         .get(&name)
         .and_then(|s| s.ready().cloned())
         .unwrap_or_else(|| decl.value.clone());
+    // mise's `[redacted]` placeholder is never a real value: it stays
+    // masked even when the row (or the whole page) is "revealed".
+    let revealed = is_revealed(show_all, revealed, &name) && !is_redacted(&raw_value);
     let exact_state = exact.get(&name);
+    let also_effective = effective_names.contains(&name);
 
     let mut row = div()
         .v_flex()
@@ -772,8 +852,6 @@ fn declaration_row(
     // Override chain (expanded): the other scope's declaration of the same
     // name plus the effective value.
     if expanded {
-        let other = this_other_declaration(cx, &name);
-        let eff_value = this_effective_value(cx, &name);
         let mut chain = div()
             .v_flex()
             .gap_0p5()
@@ -818,25 +896,6 @@ fn declaration_row(
     row.into_any_element()
 }
 
-/// The other scope's declaration of `name` (for the override chain).
-fn this_other_declaration(cx: &Context<RootView>, name: &str) -> Option<EnvDeclaration> {
-    let view = cx.entity().read(cx);
-    view.state
-        .env_other_declarations
-        .ready()
-        .and_then(|rows| rows.iter().find(|d| d.name == name).cloned())
-}
-
-/// The effective value of `name` (for the override chain).
-fn this_effective_value(cx: &Context<RootView>, name: &str) -> Option<String> {
-    let view = cx.entity().read(cx);
-    view.state.env_effective.ready().and_then(|rows| {
-        rows.iter()
-            .find(|v| v.name == name)
-            .map(|v| v.value.clone())
-    })
-}
-
 /// 「生效」 tab: final values sorted by name (core already sorts), with the
 /// filter box, the global 显示全部 toggle, source/tool annotation, copy, and
 /// delete (only for plain config declarations). Below the list: the
@@ -848,6 +907,7 @@ fn effective_tab(
     show_all: bool,
     revealed: &HashSet<String>,
     filter: &str,
+    config_tokens: &HashSet<String>,
 ) -> AnyElement {
     let theme = cx.theme().clone();
 
@@ -930,7 +990,7 @@ fn effective_tab(
             .find(|v| v.name == "PATH")
             .map(|v| v.value.clone())
     }) {
-        col = col.child(path_section(cx, &path_value));
+        col = col.child(path_section(cx, &path_value, config_tokens));
     }
 
     col.into_any_element()
@@ -1064,24 +1124,17 @@ fn effective_row(
 }
 
 /// The dedicated PATH view: one row per segment with a source hint. Config
-/// tokens come from the CURRENT scope's declarations along with the OTHER
-/// scope's (a dir declared in either file was config-provided).
-fn path_section(cx: &mut Context<RootView>, path_value: &str) -> AnyElement {
+/// tokens (computed in `render` from both scopes' declarations) feed the
+/// segment classifier.
+fn path_section(
+    cx: &mut Context<RootView>,
+    path_value: &str,
+    config_tokens: &HashSet<String>,
+) -> AnyElement {
     let theme = cx.theme().clone();
     let mono = monospace_family();
 
-    let (current, other): (Option<Vec<EnvDeclaration>>, Option<Vec<EnvDeclaration>>) = {
-        let view = cx.entity().read(cx);
-        (
-            view.state.env_declarations.ready().cloned(),
-            view.state.env_other_declarations.ready().cloned(),
-        )
-    };
-    let mut config_tokens = HashSet::new();
-    for rows in [current, other].into_iter().flatten() {
-        config_tokens.extend(config_path_tokens(&rows));
-    }
-    let hints = path_segment_hints(path_value, &config_tokens);
+    let hints = path_segment_hints(path_value, config_tokens);
 
     let mut section = div()
         .v_flex()
@@ -1762,6 +1815,59 @@ mod tests {
             .map(|r| r.name)
             .collect();
         assert_eq!(names, vec!["A", "B"]);
+    }
+
+    // ---- edit_prefill (Fix C: prefill must use the exact value) ----
+
+    #[test]
+    fn prefill_non_ambiguous_uses_declared_value() {
+        let d = decl("A", "plain", "/p/m.toml", false);
+        assert_eq!(edit_prefill(None, &d), Prefill::Declared("plain".into()));
+    }
+
+    #[test]
+    fn prefill_ambiguous_with_exact_uses_exact_value() {
+        let d = decl("A", "a b", "/p/m.toml", true);
+        assert_eq!(
+            edit_prefill(Some("a  b"), &d),
+            Prefill::Exact("a  b".into())
+        );
+    }
+
+    #[test]
+    fn prefill_ambiguous_without_exact_refuses() {
+        let d = decl("A", "a b", "/p/m.toml", true);
+        assert_eq!(edit_prefill(None, &d), Prefill::Refuse);
+    }
+
+    #[test]
+    fn prefill_redacted_never_plans_the_placeholder() {
+        // mise redacts by default; the literal `[redacted]` must not become
+        // the prefill — not even when the row parsed unambiguously.
+        let d = decl("SECRET", "[redacted]", "/p/m.toml", false);
+        assert_eq!(edit_prefill(None, &d), Prefill::Refuse);
+        // An exact read that came back redacted also refuses.
+        assert_eq!(edit_prefill(Some("[redacted]"), &d), Prefill::Refuse);
+        assert_eq!(
+            edit_prefill(Some("hunter2"), &d),
+            Prefill::Exact("hunter2".into())
+        );
+    }
+
+    // ---- diff vs `[redacted]` rows ----
+
+    #[test]
+    fn diff_redacted_rows_never_create_false_conflicts() {
+        let red = decl("SECRET", "[redacted]", "/p/m.toml", true);
+        let eff = vec![var("SECRET", "hunter2")];
+        // Redacted placeholders are not values: a column holding only the
+        // placeholder counts as ABSENT, so two redacted columns never
+        // conflict, and the effective value is not flagged against one.
+        let g_red = vec![decl("SECRET", "[redacted]", "/g.toml", true)];
+        let rows = compute_diff(Some(&g_red), Some(&[red]), &eff);
+        assert!(!rows[0].differ);
+        assert_eq!(rows[0].global, None);
+        assert_eq!(rows[0].project, None);
     }
 
     // ---- reveal / copy state ----

@@ -186,7 +186,15 @@ pub fn render(
         .min_w_0()
         .bg(theme.background);
 
-    let list = list_column(cx, filter_input, show_hidden, tasks, graph, &filter_text);
+    let list = list_column(
+        cx,
+        filter_input,
+        show_hidden,
+        tasks,
+        graph,
+        &filter_text,
+        selected,
+    );
     let detail = detail_pane(cx, tasks, graph, selected, run_busy, watch_running);
     page = page.child(list).child(detail);
     page.into_any_element()
@@ -200,6 +208,7 @@ fn list_column(
     tasks: &Loadable<Vec<Task>>,
     graph: Option<&TaskGraph>,
     filter_text: &str,
+    selected: Option<&str>,
 ) -> AnyElement {
     let theme = cx.theme().clone();
 
@@ -263,8 +272,9 @@ fn list_column(
                     .overflow_y_scrollbar()
                     .gap_1();
                 for task in rows {
-                    list =
-                        list.child(task_row(cx, task, graph, selected_name(cx)).into_any_element());
+                    list = list.child(
+                        task_row(cx, task, graph, selected.map(String::from)).into_any_element(),
+                    );
                 }
                 list.into_any_element()
             }
@@ -275,10 +285,9 @@ fn list_column(
     col.into_any_element()
 }
 
-/// The selected task name from the live view (rows highlight it).
-fn selected_name(cx: &Context<RootView>) -> Option<String> {
-    cx.entity().read(cx).state.selected_task.clone()
-}
+/* The selected task name is snapshotted once per render by `tasks_pane`
+and passed down as a plain argument — reading it off the view entity
+inside this render path would re-enter `Entity::read` and panic. */
 
 fn task_row(
     cx: &mut Context<RootView>,

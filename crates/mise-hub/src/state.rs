@@ -174,6 +174,15 @@ pub struct AppState {
     /// the detail pane can show a persistent 监听中 state; entries leave
     /// when the watch exits.
     pub task_watch_sessions: std::collections::HashMap<String, usize>,
+    /// Backup of the config file most recently copied before a write
+    /// (`use` / `set` / `unset`). Diagnostics only; the backup itself already
+    /// happened when this is `Some`, so no UI depends on it.
+    pub last_backup: Option<PathBuf>,
+    /// Where `backup_before_write` copies config files. Production uses
+    /// [`mise_core::default_backup_dir`]; the two GLOBAL-scope write tests
+    /// must point this at a tempdir so the developer's real
+    /// `~/.config/mise/config.toml` is never read or copied there.
+    pub backup_dir: PathBuf,
 }
 
 impl AppState {
@@ -212,6 +221,32 @@ impl AppState {
             selected_task: None,
             tasks_show_hidden: false,
             task_watch_sessions: std::collections::HashMap::new(),
+            last_backup: None,
+            backup_dir: mise_core::default_backup_dir(),
+        }
+    }
+
+    /// Copy the config file a scope-based write is about to touch into the
+    /// app's backup directory (spec §5.4: 写配置前先备份). Fail-closed: an
+    /// IO error aborts the write BEFORE any mise command is started.
+    pub fn backup_before_write(&mut self, path: &Path) -> Result<(), mise_core::CoreError> {
+        if let Some(backup) = mise_core::backup_file(path, &self.backup_dir)? {
+            self.last_backup = Some(backup);
+        }
+        Ok(())
+    }
+
+    /// The config file a scope-based write (`use` / `set` / `unset` by
+    /// scope) touches: the project root's `mise.toml` for project scope,
+    /// the global `~/.config/mise/config.toml` for global scope. `None` when
+    /// the root is missing (project scope is refused before this matters) or
+    /// the home directory cannot be resolved.
+    pub fn scope_config_path(&self, global: bool) -> Option<PathBuf> {
+        if global {
+            mise_core::global_config_path()
+        } else {
+            self.current_project_root()
+                .map(|root| root.join("mise.toml"))
         }
     }
 
@@ -439,10 +474,13 @@ impl AppState {
         global: bool,
         pin: bool,
     ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
-        let Some(mise) = &self.mise else {
-            return Err(mise_core::CoreError::NotFound);
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
         };
         let (global, root) = self.use_scope(global);
+        let target = self.scope_config_path(global);
+        self.backup_before_write(&target.ok_or(mise_core::CoreError::NotFound)?)?;
         let rx = match mise.use_apply_stream(spec, global, pin, root.as_deref()) {
             Ok(rx) => rx,
             Err(e) => {
@@ -452,6 +490,12 @@ impl AppState {
         };
         let scope = if global { " (--global)" } else { "" };
         let session = self.terminal.begin(format!("use {spec}{scope}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
         Ok((session, rx))
     }
 
@@ -465,8 +509,9 @@ impl AppState {
         tool: &str,
         version: &str,
     ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
-        let Some(mise) = &self.mise else {
-            return Err(mise_core::CoreError::NotFound);
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
         };
         let spec = uninstall_spec(tool, version);
         let root = self.current_project_root();
@@ -512,8 +557,9 @@ impl AppState {
         value: &str,
         global: bool,
     ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
-        let Some(mise) = &self.mise else {
-            return Err(mise_core::CoreError::NotFound);
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
         };
         let root = self.current_project_root();
         let (global, root) = if global {
@@ -524,8 +570,19 @@ impl AppState {
                 None => return Err(mise_core::CoreError::NotFound),
             }
         };
+        self.backup_before_write(
+            &self
+                .scope_config_path(global)
+                .ok_or(mise_core::CoreError::NotFound)?,
+        )?;
         let rx = mise.set_env_stream(name, value, global, root.as_deref())?;
         let session = self.terminal.begin(format!("set {name}={value}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
         Ok((session, rx))
     }
 
@@ -537,8 +594,9 @@ impl AppState {
         name: &str,
         global: bool,
     ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
-        let Some(mise) = &self.mise else {
-            return Err(mise_core::CoreError::NotFound);
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
         };
         let root = if global {
             None
@@ -548,8 +606,19 @@ impl AppState {
                     .ok_or(mise_core::CoreError::NotFound)?,
             )
         };
+        self.backup_before_write(
+            &self
+                .scope_config_path(global)
+                .ok_or(mise_core::CoreError::NotFound)?,
+        )?;
         let rx = mise.unset_env_stream(name, global, root.as_deref())?;
         let session = self.terminal.begin(format!("unset {name}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
         Ok((session, rx))
     }
 
@@ -564,12 +633,20 @@ impl AppState {
         value: &str,
         file: &Path,
     ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
-        let Some(mise) = &self.mise else {
-            return Err(mise_core::CoreError::NotFound);
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
         };
         let root = self.current_project_root();
+        self.backup_before_write(file)?;
         let rx = mise.set_env_file_stream(name, value, file, root.as_deref())?;
         let session = self.terminal.begin(format!("set {name}={value}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
         Ok((session, rx))
     }
 
@@ -583,12 +660,20 @@ impl AppState {
         name: &str,
         file: &Path,
     ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
-        let Some(mise) = &self.mise else {
-            return Err(mise_core::CoreError::NotFound);
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
         };
         let root = self.current_project_root();
+        self.backup_before_write(file)?;
         let rx = mise.unset_env_file_stream(name, file, root.as_deref())?;
         let session = self.terminal.begin(format!("unset {name}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
         Ok((session, rx))
     }
 
@@ -2654,6 +2739,8 @@ mod env_write_tests {
         let mut state = AppState::new(ProjectStore::default());
         state.mise = Some(Arc::new(mise));
         state.selection = Selection::GlobalEnv;
+        let backups = tempfile::tempdir().unwrap();
+        state.backup_dir = backups.path().to_path_buf();
 
         state.start_set_env("NODE_ENV", "production", true).unwrap();
 
@@ -2790,6 +2877,8 @@ mod env_write_tests {
         let mut state = AppState::new(ProjectStore::default());
         state.mise = Some(Arc::new(mise));
         state.selection = Selection::GlobalEnv;
+        let backups = tempfile::tempdir().unwrap();
+        state.backup_dir = backups.path().to_path_buf();
 
         state.start_unset_env("NODE_ENV", true).unwrap();
 
@@ -2797,5 +2886,77 @@ mod env_write_tests {
             seen.lock().unwrap()[0],
             vec!["unset".to_string(), "--global".into(), "NODE_ENV".into()]
         );
+    }
+
+    /// spec §5.4: before `use` writes, the target config file (project
+    /// root/mise.toml) is copied into the app's backup dir, the backup path
+    /// is echoed into the terminal session, and the write still goes through
+    /// mise (the app never writes config content itself).
+    #[test]
+    fn start_use_backs_up_target_config_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id: String = projects.add(dir.path()).unwrap().id.clone();
+        std::fs::write(dir.path().join("mise.toml"), b"[tools]\n").unwrap();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.backup_dir = backups.path().to_path_buf();
+        state.selection = Selection::ProjectTools(id.clone());
+
+        let (session, _rx) = state.start_use("node@20", false, true).unwrap();
+
+        let backup = state.last_backup.clone().expect("backup recorded");
+        assert_eq!(backup.parent().unwrap(), backups.path());
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            std::fs::read(dir.path().join("mise.toml")).unwrap(),
+            "backup bytes identical to the source file"
+        );
+        // The write still goes through mise (never a direct config edit).
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "use".to_string(),
+                "--pin".to_string(),
+                "node@20".to_string()
+            ]
+        );
+        // The session echoes where the backup landed.
+        assert!(
+            state.terminal.sessions[session]
+                .lines
+                .iter()
+                .any(|l| l.text.contains("backup: ")),
+            "terminal shows the backup path, lines={:?}",
+            state.terminal.sessions[session].lines
+        );
+    }
+
+    /// Fail closed: if the backup operation fails, the write must NOT start
+    /// (no mise invocation at all).
+    #[test]
+    fn start_use_backup_failure_refuses_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id: String = projects.add(dir.path()).unwrap().id.clone();
+        std::fs::write(dir.path().join("mise.toml"), b"[tools]\n").unwrap();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        // A FILE where the backup dir should be → create_dir_all fails.
+        let holder = tempfile::tempdir().unwrap();
+        state.backup_dir = holder.path().join("not-a-dir");
+        std::fs::write(&state.backup_dir, b"").unwrap();
+        state.selection = Selection::ProjectTools(id);
+
+        let err = state.start_use("node@20", false, true).unwrap_err();
+        assert!(matches!(err, mise_core::CoreError::Io(_)));
+        assert!(seen.lock().unwrap().is_empty(), "no write started");
+        assert!(state.terminal.sessions.is_empty());
+        assert!(state.last_backup.is_none());
     }
 }

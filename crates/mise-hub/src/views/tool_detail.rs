@@ -32,6 +32,9 @@ pub fn render(
     busy_use: bool,
     busy_uninstall: bool,
     busy_upgrade: bool,
+    // Snapshot by `tools_pane` (reading it off the view entity here would
+    // re-enter `Entity::read` mid-layout and panic).
+    apply_global: bool,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
     let apply_spec = format!("{}@{}", row.name, row.version);
@@ -43,7 +46,7 @@ pub fn render(
     // Apply targets the scope the tool was listed in: project page → project
     // config, anything else → global config (rule 2; `use_scope` resolves
     // the exact scope again when the flow runs).
-    let apply_global = row.scope == Scope::Global || apply_global_root(cx);
+    let apply_global = row.scope == Scope::Global || apply_global;
 
     let mut pane = div()
         .flex_1()
@@ -435,11 +438,4 @@ fn scope_label(scope: Scope) -> String {
         Scope::Project => t!("tools.project").to_string(),
         Scope::Global => t!("tools.global").to_string(),
     }
-}
-
-/// Whether the apply flow has a project in context: a project page applies
-/// to the project config, everything else defaults to the global config
-/// (the same resolution `use_scope` re-runs when the run actually starts).
-fn apply_global_root(cx: &Context<RootView>) -> bool {
-    cx.entity().read(cx).state.current_project_root().is_none()
 }

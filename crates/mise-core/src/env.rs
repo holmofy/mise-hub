@@ -1,9 +1,12 @@
 //! Environment-variable data layer: parsing of `mise env --json-extended`
 //! and the plain-text `mise set` listing, plus PATH segmentation helpers.
 //!
-//! Note: the mise CLI has no redact flag for variable values, so hiding
-//! secrets is a UI-level hide/show concern only; this layer always returns
-//! raw values.
+//! Note: mise DOES redact by default — a variable declared with
+//! `redact = true` is listed by `mise set` as the literal `[redacted]` (the
+//! app passes `--no-redact` to get raw values; see `Mise::env_declarations`).
+//! The literal placeholder is still treated defensively everywhere: it is
+//! never shown as a real value, never diffed as one, and never prefilled
+//! into an edit dialog (see [`is_redacted`]).
 
 use crate::error::CoreError;
 use std::path::PathBuf;
@@ -80,6 +83,15 @@ fn non_empty_path(s: String) -> Option<PathBuf> {
 
 fn non_empty_string(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// True when a value is the literal `[redacted]` placeholder `mise set`
+/// prints for variables declared with `redact = true` (mise redacts by
+/// default; the app requests `--no-redact`, so a surviving placeholder in
+/// parsed data is a misread row or a stale listing — either way it must be
+/// treated as "requires an exact read", never shown or written back).
+pub fn is_redacted(value: &str) -> bool {
+    value.trim() == "[redacted]"
 }
 
 /// True when a token looks like a config-file path: it starts with `/`, `~`,
@@ -183,11 +195,12 @@ pub fn parse_set_list(text: &str) -> Result<Vec<EnvDeclaration>, CoreError> {
             .filter(|t| looks_like_path(t.text))
             .count()
             > 1;
+        let redacted = is_redacted(&value);
         rows.push(EnvDeclaration {
             name: name.to_string(),
             value,
             source: PathBuf::from(source),
-            ambiguous: collapsed || multiple_paths,
+            ambiguous: collapsed || multiple_paths || redacted,
         });
     }
     Ok(rows)
@@ -367,6 +380,24 @@ NAME_ONLY justvalue
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, "a b");
         assert!(rows[0].ambiguous);
+    }
+
+    #[test]
+    fn set_list_redacted_row_defensively_ambiguous() {
+        // mise redacts `redact = true` declarations as `[redacted]` by
+        // default; such a row must be marked ambiguous so the UI never
+        // shows / prefills / diffs the literal placeholder as a real value.
+        let rows = parse_set_list("SECRET  [redacted]  /proj/mise.toml\n").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "SECRET");
+        assert_eq!(rows[0].value, "[redacted]");
+        assert!(rows[0].ambiguous);
+        assert!(is_redacted(&rows[0].value));
+        // SURROUNDING whitespace does not stop the placeholder from
+        // counting as redacted.
+        assert!(is_redacted(" [redacted] "));
+        assert!(!is_redacted("[redacted-value]"));
+        assert!(!is_redacted("hunter2"));
     }
 
     #[test]
