@@ -1,3 +1,4 @@
+pub mod env;
 pub mod error;
 pub mod install;
 pub mod locator;
@@ -13,6 +14,9 @@ pub mod settings;
 pub mod tools;
 pub mod types;
 
+pub use env::{
+    EnvDeclaration, EnvVar, is_declared, parse_env_extended, parse_set_list, path_segments,
+};
 pub use error::CoreError;
 pub use install::{ProcessStreamer, StreamEvent, StreamingRunner};
 pub use locator::{default_candidates, locate_in, locate_mise};

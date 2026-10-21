@@ -1,3 +1,4 @@
+use crate::env::{EnvDeclaration, EnvVar, parse_env_extended, parse_set_list};
 use crate::error::CoreError;
 use crate::manage::{UsePreview, parse_use_dry_run};
 use crate::outdated::{OutdatedTool, parse_outdated};
@@ -221,8 +222,72 @@ impl Mise {
         parse_search_table(&out.stdout)
     }
 
-    /// `-C <dir>` for project scope, `--global`-less empty for global scope
-    /// (callers add the scope flag after the subcommand).
+    /// Rows of `mise env --json-extended`, sorted by name. Fails (including
+    /// `not trusted`) when the project config is not trusted.
+    pub fn env_extended(&self, project_root: Option<&Path>) -> Result<Vec<EnvVar>, CoreError> {
+        let out = self.run(&["env", "--json-extended"], project_root)?;
+        parse_env_extended(&out.stdout)
+    }
+
+    /// Rows of the plain-text `mise set` listing (declarations only; no JSON
+    /// form exists). Ambiguous rows (value that looks like a path) should be
+    /// re-read via `env_value`.
+    pub fn env_declarations(
+        &self,
+        project_root: Option<&Path>,
+    ) -> Result<Vec<EnvDeclaration>, CoreError> {
+        let out = self.run(&["set"], project_root)?;
+        parse_set_list(&out.stdout)
+    }
+
+    /// `mise set <NAME>`: prints only that value (the documented fallback for
+    /// ambiguous `mise set` table rows). Returns trimmed stdout.
+    pub fn env_value(&self, name: &str, project_root: Option<&Path>) -> Result<String, CoreError> {
+        let out = self.run(&["set", name], project_root)?;
+        Ok(out.stdout.trim().to_string())
+    }
+
+    /// Streamed `mise [-C dir] set [--global] NAME=VALUE`. `--global` must
+    /// come AFTER the subcommand. `NAME=VALUE` is passed as ONE argv element
+    /// so values with spaces stay intact.
+    pub fn set_env_stream(
+        &self,
+        name: &str,
+        value: &str,
+        global: bool,
+        project_root: Option<&Path>,
+    ) -> Result<Receiver<StreamEvent>, CoreError> {
+        let mut args = self.base_or_global(global, project_root);
+        args.push("set".into());
+        if global {
+            args.push("--global".into());
+        }
+        args.push(format!("{name}={value}"));
+        self.spawn_stream(args)
+    }
+
+    /// Streamed `mise [-C dir] unset [--global] NAME`. `--global` must come
+    /// AFTER the subcommand.
+    pub fn unset_env_stream(
+        &self,
+        name: &str,
+        global: bool,
+        project_root: Option<&Path>,
+    ) -> Result<Receiver<StreamEvent>, CoreError> {
+        let mut args = self.base_or_global(global, project_root);
+        args.push("unset".into());
+        if global {
+            args.push("--global".into());
+        }
+        args.push(name.into());
+        self.spawn_stream(args)
+    }
+
+    /// `-C <dir>` for project scope, empty for global scope (callers add the
+    /// `--global` flag themselves). NOTE: different mise subcommands accept
+    /// `--global` in different positions; for `outdated`, `upgrade`, `use`,
+    /// `set`, and `unset` it is a subcommand flag and must be placed AFTER
+    /// the subcommand, so `base_or_global` never adds it.
     fn base_or_global(&self, global: bool, project_root: Option<&Path>) -> Vec<String> {
         if global {
             vec![]
@@ -607,6 +672,105 @@ recursively searches directories ... https://github.com/BurntSushi/ripgrep\n";
             seen.lock().unwrap()[0],
             vec!["search", "--no-header", "--all", "cargo:ripgrep"]
         );
+    }
+
+    // ---- M3-T1: env ----
+
+    const ENV_JSON: &str = r#"{"A": {"source": "/proj/mise.toml", "value": "1"}}"#;
+
+    #[test]
+    fn env_extended_argv_scoped_to_project() {
+        let (m, seen, _) = mise_rec_stream(ENV_JSON);
+        m.env_extended(Some(Path::new("/proj"))).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["-C", "/proj", "env", "--json-extended"]
+        );
+    }
+
+    #[test]
+    fn env_extended_argv_unscoped() {
+        let (m, seen, _) = mise_rec_stream(ENV_JSON);
+        assert_eq!(m.env_extended(None).unwrap().len(), 1);
+        assert_eq!(seen.lock().unwrap()[0], vec!["env", "--json-extended"]);
+    }
+
+    #[test]
+    fn env_declarations_argv_and_parse() {
+        let (m, seen, _) = mise_rec_stream("A  1  /proj/mise.toml\n");
+        let rows = m.env_declarations(Some(Path::new("/proj"))).unwrap();
+        assert_eq!(seen.lock().unwrap()[0], vec!["-C", "/proj", "set"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "A");
+    }
+
+    #[test]
+    fn env_value_returns_trimmed_stdout() {
+        // The documented fallback for ambiguous table rows.
+        let (m, seen, _) = mise_rec_stream("x y z\n");
+        let v = m.env_value("B", Some(Path::new("/proj"))).unwrap();
+        assert_eq!(seen.lock().unwrap()[0], vec!["-C", "/proj", "set", "B"]);
+        assert_eq!(v, "x y z");
+    }
+
+    #[test]
+    fn set_env_stream_project_keeps_name_value_pair_as_one_arg() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.set_env_stream("B", "x y z", false, Some(Path::new("/proj")));
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec!["-C", "/proj", "set", "B=x y z"]
+        );
+    }
+
+    #[test]
+    fn set_env_stream_global_flag_after_subcommand() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.set_env_stream("NODE_ENV", "production", true, Some(Path::new("/proj")));
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec!["set", "--global", "NODE_ENV=production"]
+        );
+    }
+
+    #[test]
+    fn unset_env_stream_project_attr() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.unset_env_stream("FOO", false, Some(Path::new("/proj")));
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec!["-C", "/proj", "unset", "FOO"]
+        );
+    }
+
+    #[test]
+    fn unset_env_stream_global_flag_after_subcommand() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.unset_env_stream("FOO", true, None);
+        assert_eq!(stream.lock().unwrap()[0], vec!["unset", "--global", "FOO"]);
+    }
+
+    #[test]
+    fn env_non_zero_exit_is_command_failed() {
+        // M2-T5: untrusted configs make env/set fail with "not trusted".
+        struct Failing;
+        impl CommandRunner for Failing {
+            fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+                Ok(CommandOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: "config not trusted".into(),
+                })
+            }
+        }
+        let m = Mise::new("mise".into(), Arc::new(Failing), Arc::new(NoopStreamer));
+        assert!(m.env_extended(None).is_err());
+        assert!(m.env_declarations(None).is_err());
+        assert!(m.env_value("A", None).is_err());
+        assert!(matches!(
+            m.env_extended(None).unwrap_err(),
+            CoreError::CommandFailed { code: 1, .. }
+        ));
     }
 
     #[test]
