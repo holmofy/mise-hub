@@ -1,5 +1,7 @@
 app:
   name: mise-hub
+common:
+  retry: Retry
 nav:
   workbench: Workbench
   discover: Discover
@@ -33,6 +35,7 @@ tools:
   apply: Apply version
   apply_m2_note: Not available yet — applying a version is planned for M2
   empty: No installed tools
+  no_match: No tools match this search
   loading: Loading…
   failed: Failed to load tools
   select_tool: Select a tool
@@ -42,6 +45,7 @@ discover:
   deep_search: Deep search
   deep_search_note: mise search --all is online and ships in M2 — not implemented yet
   no_results: No tools match this query
+  registry_empty: The tool registry is empty
   loading: Loading tool registry…
   failed: Failed to load the tool registry
   installed: Installed

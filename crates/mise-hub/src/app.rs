@@ -136,7 +136,7 @@ impl RootView {
     }
 
     /// Refresh installed tools, storing failures on the `installed` Loadable.
-    fn refresh_installed(&mut self) {
+    pub(crate) fn refresh_installed(&mut self) {
         match self.state.refresh_installed() {
             Ok(()) => {}
             Err(e) => self.state.installed = Loadable::Failed(e.to_string()),
@@ -324,10 +324,20 @@ impl RootView {
             &installed_names,
             &self.discover_scroll,
             &self.state.registry,
+            &query,
             &self.state.versions,
             self.state.versions_tool.as_deref(),
             not_active_version,
         )
+    }
+
+    /// Retry the registry load after a failure (discover page): `ensure_registry`
+    /// re-runs `mise registry --json` because the state is `Failed`, and renders
+    /// the raw error again if it still fails (AGENTS.md rule 9).
+    pub(crate) fn retry_registry(&mut self, cx: &mut Context<Self>) {
+        self.state.registry = Loadable::Loading;
+        let _ = self.state.ensure_registry();
+        cx.notify();
     }
 
     /// Open a folder picker and add the chosen folder as a project, then select
@@ -418,7 +428,13 @@ impl RootView {
             Loadable::Failed(err) => Some(err.as_str()),
             _ => None,
         };
-        let loading = matches!(self.state.installed, Loadable::Loading);
+        // Idle counts as loading too: it only ever happens between the
+        // selection change and the (synchronous) refresh below it — never as
+        // a settled "no tools installed".
+        let loading = !matches!(
+            self.state.installed,
+            Loadable::Ready(_) | Loadable::Failed(_)
+        );
         let list = tool_list::render(
             cx,
             &self.search_input,
@@ -427,6 +443,7 @@ impl RootView {
             filter,
             show_filter,
             loading,
+            !search_query.is_empty(),
             load_error,
         );
         let detail = match &selected_row {

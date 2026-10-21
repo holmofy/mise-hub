@@ -10,7 +10,10 @@ pub enum Selection {
     GlobalTasks,
     GlobalEnv,
     ProjectTools(String),
+    // Milestone scaffolding: Tasks is wired up in M4, Environment in M3.
+    #[allow(dead_code)] // M4 scaffolding
     ProjectTasks(String),
+    #[allow(dead_code)] // M3 scaffolding
     ProjectEnv(String),
 }
 
@@ -273,6 +276,10 @@ pub struct TerminalSession {
     pub status: RunStatus,
 }
 
+/// Maximum rendered lines kept per terminal session. A chatty install must
+/// not grow the UI's memory without bound; only the newest lines are kept.
+pub const MAX_TERMINAL_LINES: usize = 5000;
+
 impl TerminalSession {
     /// Append raw output text to this session, shaped like real process
     /// output: the streamer emits one logical line per event (its `lines()`
@@ -302,6 +309,13 @@ impl TerminalSession {
                 stream,
                 text: visible.to_string(),
             });
+        }
+        // Cap retained output: keep only the newest `MAX_TERMINAL_LINES`
+        // lines so a very chatty install cannot grow memory without bound.
+        // Older lines are dropped from the front (fade like a real terminal).
+        if self.lines.len() > MAX_TERMINAL_LINES {
+            let excess = self.lines.len() - MAX_TERMINAL_LINES;
+            self.lines.drain(0..excess);
         }
     }
 }
@@ -598,6 +612,41 @@ mod terminal_tests {
         term.push_event_to(0, StreamEvent::Stdout("orphan".into()));
         term.push_event_to(0, StreamEvent::Exited(0));
         assert!(term.active_session().is_none());
+    }
+
+    /// A very chatty run must not grow memory without bound: the session
+    /// keeps only the last `MAX_TERMINAL_LINES` lines.
+    #[test]
+    fn feed_caps_lines_at_max_terminal_lines() {
+        let mut term = TerminalState::default();
+        term.begin("install chatty");
+        let total = MAX_TERMINAL_LINES + 500;
+        for i in 0..total {
+            term.push_event_to(0, StreamEvent::Stdout(format!("line {i}")));
+        }
+        let session = term.active_session().unwrap();
+        assert_eq!(session.lines.len(), MAX_TERMINAL_LINES);
+        // The OLDEST lines were dropped: the last line is the newest output.
+        assert_eq!(
+            session.lines[session.lines.len() - 1].text,
+            format!("line {}", total - 1)
+        );
+        assert_eq!(
+            session.lines[0].text,
+            format!("line {}", total - MAX_TERMINAL_LINES)
+        );
+    }
+
+    /// A run that emits fewer than the cap keeps every line (cap never
+    /// trims a short session).
+    #[test]
+    fn feed_under_cap_keeps_all_lines() {
+        let mut term = TerminalState::default();
+        term.begin("install small");
+        for i in 0..10 {
+            term.push_event_to(0, StreamEvent::Stdout(format!("line {i}")));
+        }
+        assert_eq!(term.active_session().unwrap().lines.len(), 10);
     }
 
     /// Program output arrives '\n'-terminated per event from the streamer.

@@ -162,7 +162,7 @@ pub fn render(state: &TerminalState, cx: &mut Context<RootView>) -> impl IntoEle
             .overflow_y_scrollbar()
             .px_3()
             .py_1()
-            .font_family("Menlo")
+            .font_family(crate::theme::monospace_family())
             .text_xs();
         if let Some(session) = state.active_session() {
             for line in &session.lines {

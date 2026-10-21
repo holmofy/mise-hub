@@ -1,5 +1,6 @@
 use crate::app::RootView;
 use crate::state::Loadable;
+use crate::theme::monospace_family;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -98,7 +99,7 @@ fn versions_pane(
                         .child(
                             div()
                                 .text_sm()
-                                .font_family("Menlo")
+                                .font_family(monospace_family())
                                 .min_w_0()
                                 .text_ellipsis()
                                 .child(version_text.clone()),
@@ -198,8 +199,9 @@ fn versions_pane(
 /// stays alive on `RootView::discover_hits` so the virtual list closure can
 /// slice it per frame without re-running the search. `installed_names` are
 /// the tool names from `mise ls` used to mark already-installed rows.
-/// `registry` carries the load state: `Loading` / `Idle` show progress and
-/// `Failed` is shown raw (AGENTS.md rule 9).
+/// `query` distinguishes "search matched nothing" from a genuinely empty
+/// install. `registry` carries the load state: `Loading` / `Idle` show
+/// progress and `Failed` is shown raw with a retry (AGENTS.md rule 9).
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     cx: &mut Context<RootView>,
@@ -208,6 +210,7 @@ pub fn render(
     installed_names: &HashSet<String>,
     scrolling: &VirtualListScrollHandle,
     registry: &Loadable<Vec<ToolEntry>>,
+    query: &str,
     versions: &Loadable<Vec<RemoteVersion>>,
     versions_tool: Option<&str>,
     not_active_version: Option<String>,
@@ -218,7 +221,31 @@ pub fn render(
         Loadable::Failed(err) => div()
             .flex_1()
             .min_h_0()
-            .child(error_panel(cx, err.as_str()))
+            .v_flex()
+            .p_3()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(t!("discover.failed").to_string()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .overflow_y_scrollbar()
+                    .child(err.to_string()),
+            )
+            .child(
+                Button::new("registry-retry")
+                    .outline()
+                    .small()
+                    .label(t!("common.retry").to_string())
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.retry_registry(cx);
+                    })),
+            )
             .into_any_element(),
         // `Idle` loads too: mise was only just detected (setup page path).
         Loadable::Idle | Loadable::Loading => div()
@@ -226,13 +253,21 @@ pub fn render(
             .min_h_0()
             .child(centered(&theme, t!("discover.loading").to_string()))
             .into_any_element(),
-        // Only reachable when a non-empty query matched nothing: browse mode
-        // (empty query) always yields the full registry.
-        Loadable::Ready(_) if hits.is_empty() => div()
-            .flex_1()
-            .min_h_0()
-            .child(centered(&theme, t!("discover.no_results").to_string()))
-            .into_any_element(),
+        // Loaded, zero rows. Browsing (empty query) over a loaded registry
+        // that yields nothing means the registry itself is empty; a
+        // non-empty query is a search that matched nothing.
+        Loadable::Ready(_) if hits.is_empty() => {
+            let message = if query.trim().is_empty() {
+                t!("discover.registry_empty").to_string()
+            } else {
+                t!("discover.no_results").to_string()
+            };
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(centered(&theme, message))
+                .into_any_element()
+        }
         Loadable::Ready(_) => {
             let item_sizes = Rc::new(vec![Size::new(px(0.), px(ROW_HEIGHT)); hits.len()]);
             let installed = installed_names.clone();
@@ -441,27 +476,4 @@ fn centered(theme: &Theme, text: String) -> impl IntoElement {
         .text_color(theme.muted_foreground)
         .text_sm()
         .child(text)
-}
-
-fn error_panel(cx: &Context<RootView>, err: &str) -> impl IntoElement {
-    let theme = cx.theme();
-    div()
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scrollbar()
-        .p_3()
-        .v_flex()
-        .gap_2()
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.danger)
-                .child(t!("discover.failed").to_string()),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(err.to_string()),
-        )
 }

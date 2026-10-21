@@ -23,8 +23,10 @@ fn main() {
         } else {
             // First launch: follow the system language, then persist the
             // resolved locale so subsequent launches are stable.
-            let mut settings = mise_core::AppSettings::default();
-            settings.locale = i18n::locale_from_system(sys_locale::get_locale().as_deref()).into();
+            let settings = mise_core::AppSettings {
+                locale: i18n::locale_from_system(sys_locale::get_locale().as_deref()).into(),
+                ..Default::default()
+            };
             let _ = settings.save(&settings_path);
             settings
         };

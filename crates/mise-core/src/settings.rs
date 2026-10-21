@@ -70,9 +70,10 @@ mod tests {
     fn roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let mut s = AppSettings::default();
-        s.theme = "Default Dark".into();
-        s.locale = "zh-CN".into();
+        let s = AppSettings {
+            theme: "Default Dark".into(),
+            locale: "zh-CN".into(),
+        };
         s.save(&path).unwrap();
         assert_eq!(AppSettings::load(&path).unwrap(), s);
     }

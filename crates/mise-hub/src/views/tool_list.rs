@@ -1,4 +1,5 @@
 use crate::app::RootView;
+use crate::state::Loadable;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -22,9 +23,12 @@ pub fn row_key(row: &ToolRow) -> String {
 /// clickable rows. `rows` is already filtered (scope + search query) by the
 /// caller; `show_filter` decides whether the scope segmented control renders
 /// (project tools page only). `loading` shows the loading state so a slow
-/// `mise ls` is distinguishable from "no tools installed". `error` replaces
-/// the rows with the raw failure output when loading `mise ls` went wrong
-/// (AGENTS.md rule 9: show the real error, never a bare "failed").
+/// `mise ls` is distinguishable from "no tools installed". `searched` is true
+/// when a non-empty search query is active, so "nothing installed" and "no
+/// match for this search" get distinct copy. `error` replaces the rows with
+/// the raw failure output plus a retry button when loading `mise ls` went
+/// wrong (AGENTS.md rule 9: show the real error, never a bare "failed").
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     cx: &mut Context<RootView>,
     search_input: &Entity<InputState>,
@@ -33,6 +37,7 @@ pub fn render(
     filter: ScopeFilter,
     show_filter: bool,
     loading: bool,
+    searched: bool,
     error: Option<&str>,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
@@ -77,7 +82,8 @@ pub fn render(
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(err.to_string()),
-                ),
+                )
+                .child(retry_button(cx)),
         );
     } else if loading {
         col = col.child(
@@ -91,6 +97,8 @@ pub fn render(
                 .child(t!("tools.loading").to_string()),
         );
     } else if rows.is_empty() {
+        // Distinct copy: "nothing installed" (empty query) vs "nothing
+        // matched" (a search is active but returned zero rows).
         col = col.child(
             div()
                 .flex_1()
@@ -99,7 +107,11 @@ pub fn render(
                 .p_4()
                 .text_color(theme.muted_foreground)
                 .text_sm()
-                .child(t!("tools.empty").to_string()),
+                .child(if searched {
+                    t!("tools.no_match").to_string()
+                } else {
+                    t!("tools.empty").to_string()
+                }),
         );
     } else {
         // A tool present in both scopes shows as two rows; the non-active one
@@ -128,6 +140,19 @@ pub fn render(
     }
 
     col
+}
+
+/// Retry affordance shown with a load failure: reloads `mise ls`.
+fn retry_button(cx: &mut Context<RootView>) -> impl IntoElement {
+    Button::new("tools-retry")
+        .outline()
+        .small()
+        .label(t!("common.retry").to_string())
+        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+            this.state.installed = Loadable::Loading;
+            this.refresh_installed();
+            cx.notify();
+        }))
 }
 
 fn scope_filter(cx: &mut Context<RootView>, filter: ScopeFilter) -> impl IntoElement {

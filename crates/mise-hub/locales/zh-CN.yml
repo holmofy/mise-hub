@@ -1,5 +1,7 @@
 app:
   name: mise-hub
+common:
+  retry: 重试
 nav:
   workbench: 工作台
   discover: 发现
@@ -33,6 +35,7 @@ tools:
   apply: 应用版本
   apply_m2_note: 本里程碑暂未实现，M2 将提供版本应用
   empty: 暂无已安装的工具
+  no_match: 没有匹配此搜索的工具
   loading: 加载中…
   failed: 加载工具失败
   select_tool: 选择一个工具
@@ -42,6 +45,7 @@ discover:
   deep_search: 深度搜索
   deep_search_note: mise search --all 需联网，M2 提供——本里程碑未实现
   no_results: 没有匹配此查询的工具
+  registry_empty: 工具索引为空
   loading: 正在加载工具索引…
   failed: 加载工具索引失败
   installed: 已安装
