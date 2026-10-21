@@ -1,5 +1,5 @@
 use crate::i18n;
-use crate::state::{AppState, Loadable, Selection};
+use crate::state::{AppState, ApplyFlow, Loadable, Selection};
 use crate::theme;
 use crate::views::{discover, setup, sidebar, terminal, tool_detail, tool_list, upgrade};
 use gpui_kit::component::ActiveTheme;
@@ -12,10 +12,11 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use mise_core::{AppSettings, ScopeFilter, SearchHit, StreamEvent, ToolRow};
+use mise_core::{AppSettings, CoreError, ScopeFilter, SearchHit, StreamEvent, ToolRow};
 use rust_i18n::t;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 
 /// Locale choices exposed by the language picker: (locale code, display label).
 const LOCALES: [(&str, &str); 2] = [("en", "English"), ("zh-CN", "中文")];
@@ -44,6 +45,11 @@ pub struct RootView {
     pub notice: Option<String>,
     /// The 「包含超出配置范围的版本（--bump）」 toggle on the upgrade page.
     pub upgrade_bump: bool,
+    /// One open 「应用版本」 flow: spec, scope, pin choice and the async
+    /// `mise use --dry-run` preview the confirm dialog renders. See
+    /// `ApplyFlow` — the dialog reads this on every rebuild, so the validator
+    /// stays honest about what will be written before anything is written.
+    pub apply_flow: Option<ApplyFlow>,
     _search_subscription: Subscription,
     _discover_subscription: Subscription,
 }
@@ -97,6 +103,7 @@ impl RootView {
             discover_scroll: VirtualListScrollHandle::new(),
             notice: None,
             upgrade_bump: false,
+            apply_flow: None,
             _search_subscription: search_subscription,
             _discover_subscription: discover_subscription,
         };
@@ -122,6 +129,11 @@ impl RootView {
         self.state.selected_tool = None;
         self.tool_filter = ScopeFilter::All;
         self.notice = None;
+        // A leaving page's tool detail and apply dialog data must not bleed
+        // into the next one; the async loader guards drop them too.
+        self.state.tool_info = Loadable::Idle;
+        self.state.tool_info_tool = None;
+        self.apply_flow = None;
         if self.is_tools_page() {
             // Same loading marker as startup: the refresh below is synchronous,
             // but a slow `mise ls` must not be mistaken for an empty list.
@@ -217,6 +229,301 @@ impl RootView {
         .detach();
     }
 
+    /// Load `mise tool <name> --json` for the tools page asynchronously,
+    /// exactly like `select_discover_tool`: the blocking call runs on a
+    /// background thread, the UI thread only awaits the bridged channel, and
+    /// a stale result for a differently-selected tool is dropped. A failure
+    /// keeps the raw error (`Loadable::Failed`) so the detail pane renders it
+    /// while the basic `mise ls` fields stay visible (AGENTS.md rule 9).
+    pub(crate) fn load_tool_info(&mut self, tool: String, cx: &mut Context<Self>) {
+        // Coalesce: the same tool already Loading/Ready means a fetch is
+        // (was just) running; only a Failed result refetches on reselect.
+        if self.state.tool_info_tool.as_deref() == Some(tool.as_str())
+            && matches!(self.state.tool_info, Loadable::Loading | Loadable::Ready(_))
+        {
+            return;
+        }
+
+        self.state.tool_info_tool = Some(tool.clone());
+        self.state.tool_info = Loadable::Loading;
+        cx.notify();
+
+        let Some(mise) = self.state.mise.clone() else {
+            self.state.tool_info = Loadable::Failed(t!("tools.info_unavailable").to_string());
+            cx.notify();
+            return;
+        };
+        let root = self.state.current_project_root();
+        let (tx, rx) = async_channel::unbounded();
+        let thread_tool = tool.clone();
+        std::thread::spawn(move || {
+            let result = mise.tool_info(&thread_tool, root.as_deref());
+            tx.send_blocking(result).ok();
+        });
+        let expected_tool = tool;
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    // Stale-result guard: only apply while this tool is still
+                    // the selected one.
+                    if this.state.tool_info_tool.as_deref() == Some(&expected_tool) {
+                        this.state.tool_info = match result {
+                            Ok(info) => Loadable::Ready(info),
+                            Err(e) => Loadable::Failed(e.to_string()),
+                        };
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Open the 「应用版本」 confirm dialog for `spec` in the given scope and
+    /// START the async `mise use --dry-run` preview that fills it. The write
+    /// (`mise use`) happens ONLY if the user confirms the dialog afterwards
+    /// (AGENTS.md rule 4 + rule 10: preview and impact shown before acting).
+    pub(crate) fn prompt_apply(
+        &mut self,
+        spec: String,
+        global: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_flow = Some(ApplyFlow {
+            spec: spec.clone(),
+            global,
+            pin: false,
+            preview: Loadable::Loading,
+        });
+        cx.notify();
+
+        // The preview is a blocking subprocess — background thread, bridged
+        // back through an async channel (UI thread never blocks on IO).
+        if let Some(mise) = self.state.mise.clone() {
+            let (g, root) = self.state.use_scope(global);
+            let (tx, rx) = async_channel::unbounded();
+            let thread_spec = spec.clone();
+            let mise_ref = mise;
+            std::thread::spawn(move || {
+                let result =
+                    AppState::use_preview(mise_ref.as_ref(), &thread_spec, g, root.as_deref());
+                tx.send_blocking(result).ok();
+            });
+            let expected = spec.clone();
+            cx.spawn(async move |this, cx| {
+                if let Ok(result) = rx.recv().await {
+                    this.update(cx, |this, cx| {
+                        // Only fill a dialog still open for THIS spec.
+                        if let Some(flow) =
+                            &mut this.apply_flow.iter_mut().find(|f| f.spec == expected)
+                        {
+                            flow.preview = match result {
+                                Ok(p) => Loadable::Ready(p),
+                                Err(e) => Loadable::Failed(e.to_string()),
+                            };
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        } else {
+            if let Some(flow) = &mut self.apply_flow {
+                flow.preview = Loadable::Failed(t!("tools.apply_unavailable").to_string());
+            }
+            cx.notify();
+        }
+
+        // Open the dialog NOW so it renders its loading state while the
+        // preview streams in; the content builder re-runs on every redraw
+        // and reads the live flow through the weak entity, so the preview
+        // appears in place and the pin toggle stays reactive.
+        let weak = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let weak = weak.clone();
+            alert
+                .confirm()
+                .title(t!("tools.apply_confirm_title").to_string())
+                .description({
+                    // Built fresh on every dialog rebuild: this reads the
+                    // LIVE flow (preview fills in asynchronously inside the
+                    // open dialog), not a frozen snapshot.
+                    let weak = weak.clone();
+                    tool_detail::apply_dialog_body(weak, cx)
+                })
+                .ok_text(t!("tools.apply_ok").to_string())
+                .cancel_text(t!("nav.cancel").to_string())
+                .on_ok(move |_, _, cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |this, cx| {
+                            if let Some(flow) = this.apply_flow.take() {
+                                // Only a ready preview may proceed: a failed
+                                // or still-loading preview closes with
+                                // nothing written.
+                                if matches!(flow.preview, Loadable::Ready(_)) {
+                                    this.run_use(&flow.spec, flow.global, flow.pin, cx);
+                                }
+                            }
+                            cx.notify();
+                        });
+                    }
+                    true
+                })
+        });
+    }
+
+    /// Stream `mise use [--pin] <spec>` into a NEW terminal session after the
+    /// user confirmed. `begin_run` blocks the action buttons for the spec
+    /// while it streams; on `Exited` the installed list and the outdated
+    /// list are refreshed (the config change can move activation and what
+    /// counts as outdated) and `apply_status_key` then shows 已生效.
+    pub(crate) fn run_use(&mut self, spec: &str, global: bool, pin: bool, cx: &mut Context<Self>) {
+        let spec = spec.to_string();
+        self.state.begin_run("use", &spec);
+        let (session, rx) = match self.state.start_use(&spec, global, pin) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.spawn_error_session(spec, "use", e, cx);
+                return;
+            }
+        };
+        let done_spec = spec.clone();
+        self.stream_to_terminal(
+            session,
+            rx,
+            move |this, _cx| {
+                this.state.finish_run("use", &done_spec);
+                this.state.outdated = Loadable::Loading;
+                this.refresh_outdated();
+                this.refresh_installed();
+            },
+            cx,
+        );
+    }
+
+    /// Ask for confirmation, then stream `mise uninstall <tool>@<version>`.
+    /// Rule 3: the uninstall NEVER touches any config file — the dialog
+    /// states the exact `tool@version` and that the config entry stays.
+    pub(crate) fn prompt_uninstall(
+        &mut self,
+        tool: String,
+        version: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let weak = weak.clone();
+            let tool = tool.clone();
+            let version = version.clone();
+            alert
+                .confirm()
+                .title(t!("tools.uninstall_confirm_title").to_string())
+                .description(
+                    t!(
+                        "tools.uninstall_confirm_body",
+                        spec = format!("{tool}@{version}")
+                    )
+                    .to_string(),
+                )
+                .ok_text(t!("tools.uninstall").to_string())
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text(t!("nav.cancel").to_string())
+                .on_ok(move |_, _, cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |this, cx| this.run_uninstall(&tool, &version, cx));
+                    }
+                    true
+                })
+        });
+    }
+
+    /// Stream `mise uninstall` and open its terminal session, mirroring
+    /// `run_install`. Uninstall only removes installed files; the config is
+    /// untouched (rule 3), so only the installed list is refreshed on exit.
+    pub(crate) fn run_uninstall(&mut self, tool: &str, version: &str, cx: &mut Context<Self>) {
+        let spec = crate::state::uninstall_spec(tool, version);
+        self.state.begin_run("uninstall", &spec);
+        let (session, rx) = match self.state.start_uninstall(tool, version) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.spawn_error_session(spec, "uninstall", e, cx);
+                return;
+            }
+        };
+        let done_spec = spec;
+        self.stream_to_terminal(
+            session,
+            rx,
+            move |this, _cx| {
+                this.state.finish_run("uninstall", &done_spec);
+                this.refresh_installed();
+            },
+            cx,
+        );
+    }
+
+    /// Open a session tab that immediately shows the raw spawn error as a
+    /// failed run (rule 9), and release the in-flight key this run took.
+    fn spawn_error_session(
+        &mut self,
+        spec: String,
+        kind: &str,
+        e: CoreError,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self.state.terminal.begin(format!("{kind} {spec}"));
+        self.state
+            .terminal
+            .push_event_to(session, StreamEvent::Stderr(e.to_string()));
+        self.state
+            .terminal
+            .push_event_to(session, StreamEvent::Exited(-1));
+        self.state.finish_run(kind, &spec);
+        cx.notify();
+    }
+
+    /// Bridge a core streaming receiver onto a background thread + async
+    /// channel and route every event into the run's OWN terminal session;
+    /// the caller's `done` hook runs once when the run exits.
+    fn stream_to_terminal(
+        &mut self,
+        session: usize,
+        rx: Receiver<StreamEvent>,
+        done: impl Fn(&mut RootView, &mut Context<RootView>) + 'static,
+        cx: &mut Context<RootView>,
+    ) {
+        let (tx, async_rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            for event in rx {
+                if tx.send_blocking(event).is_err() {
+                    break;
+                }
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = async_rx.recv().await {
+                let done_event = matches!(event, StreamEvent::Exited(_));
+                this.update(cx, |this, cx| {
+                    this.state.terminal.push_event_to(session, event.clone());
+                    if done_event {
+                        done(this, cx);
+                    }
+                    cx.notify();
+                })
+                .ok();
+                if done_event {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Start an install (install ONLY, never `mise use` — AGENTS.md rule 4)
     /// and stream its output into a new terminal session. The std receiver
     /// from core is bridged onto an async channel by a background thread —
@@ -245,44 +552,29 @@ impl RootView {
             }
         };
 
-        let (tx, async_rx) = async_channel::unbounded();
-        std::thread::spawn(move || {
-            for event in rx {
-                if tx.send_blocking(event).is_err() {
-                    break;
-                }
-            }
-        });
-
-        cx.spawn(async move |this, cx| {
-            while let Ok(event) = async_rx.recv().await {
-                let done = matches!(event, StreamEvent::Exited(_));
-                this.update(cx, |this, cx| {
-                    this.state.terminal.push_event_to(session, event.clone());
-                    if done {
-                        // Refresh only on completion: rule 4 — after the
-                        // install finished the panel can honestly show
-                        // 「已安装 · 未生效」 with the apply actions exposed.
-                        this.refresh_installed();
-                    }
-                    cx.notify();
-                })
-                .ok();
-                if done {
-                    break;
-                }
-            }
-        })
-        .detach();
+        self.stream_to_terminal(
+            session,
+            rx,
+            |this, _cx| {
+                // Refresh only on completion: rule 4 — after the
+                // install finished the panel can honestly show
+                // 「已安装 · 未生效」 with the apply actions exposed.
+                this.refresh_installed();
+            },
+            cx,
+        );
     }
 
     /// Start `mise upgrade` (spec = None for 全部升级, Some(name) for a single
     /// row) and stream its output into a NEW terminal session, like
     /// `run_install`. When the run exits, both the outdated list and the
     /// installed list are refreshed so the page and the badge reflect the
-    /// upgrade that just happened.
-    pub(crate) fn run_upgrade(&mut self, spec: Option<String>, cx: &mut Context<Self>) {
-        let bump = self.upgrade_bump;
+    /// upgrade that just happened. `bump` is chosen by the upgrade page's
+    /// toggle; the tool-detail upgrade action passes `false`.
+    pub(crate) fn run_upgrade(&mut self, spec: Option<String>, bump: bool, cx: &mut Context<Self>) {
+        if let Some(name) = spec.as_deref() {
+            self.state.begin_run("upgrade", name);
+        }
         let (session, rx) = match self.state.start_upgrade(spec.as_deref(), bump) {
             Ok((session, rx)) => (session, rx),
             Err(e) => {
@@ -303,38 +595,30 @@ impl RootView {
             }
         };
 
-        let (tx, async_rx) = async_channel::unbounded();
-        std::thread::spawn(move || {
-            for event in rx {
-                if tx.send_blocking(event).is_err() {
-                    break;
+        let done_spec = spec.clone();
+        self.stream_to_terminal(
+            session,
+            rx,
+            move |this, _cx| {
+                if let Some(name) = &done_spec {
+                    this.state.finish_run("upgrade", name);
                 }
-            }
-        });
+                // Refresh only on completion: the upgrade run changed
+                // what is installed AND what counts as outdated, so
+                // the page rows and the sidebar badge must both catch
+                // up ("available upgrades" must not go stale).
+                this.state.outdated = Loadable::Loading;
+                this.refresh_outdated();
+                this.refresh_installed();
+            },
+            cx,
+        );
+    }
 
-        cx.spawn(async move |this, cx| {
-            while let Ok(event) = async_rx.recv().await {
-                let done = matches!(event, StreamEvent::Exited(_));
-                this.update(cx, |this, cx| {
-                    this.state.terminal.push_event_to(session, event.clone());
-                    if done {
-                        // Refresh only on completion: the upgrade run changed
-                        // what is installed AND what counts as outdated, so
-                        // the page rows and the sidebar badge must both catch
-                        // up ("available upgrades" must not go stale).
-                        this.state.outdated = Loadable::Loading;
-                        this.refresh_outdated();
-                        this.refresh_installed();
-                    }
-                    cx.notify();
-                })
-                .ok();
-                if done {
-                    break;
-                }
-            }
-        })
-        .detach();
+    /// Per-tool upgrade from the tool detail pane (spec §6.3): upgrades the
+    /// upgraded tool only, scope follows the current selection, no `--bump`.
+    pub(crate) fn run_tool_upgrade(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.run_upgrade(Some(name.to_string()), false, cx);
     }
 
     /// Save the active terminal session's text through an rfd save dialog.
@@ -397,6 +681,17 @@ impl RootView {
             .versions_tool
             .as_deref()
             .and_then(|tool| self.state.installed_but_not_active(tool));
+        // The 「应用版本」 flow on the discover page: busy state for the
+        // exact spec the banner would apply, and whether a project is in
+        // context at all (without one an apply labeled "this project" would
+        // silently be global — mislabeled scopes are dishonest, rule-wise).
+        let apply_spec = not_active_version
+            .as_ref()
+            .zip(self.state.versions_tool.as_deref())
+            .map(|(version, tool)| format!("{tool}@{version}"));
+        let apply_busy = apply_spec
+            .as_deref()
+            .is_some_and(|spec| self.state.is_busy("use", spec));
         discover::render(
             cx,
             &self.discover_input,
@@ -408,6 +703,8 @@ impl RootView {
             &self.state.versions,
             self.state.versions_tool.as_deref(),
             not_active_version,
+            self.state.current_project_root().is_some(),
+            apply_busy,
         )
     }
 
@@ -530,8 +827,29 @@ impl RootView {
             !search_query.is_empty(),
             load_error,
         );
+        // Per-tool actions (apply / uninstall / upgrade) read the CURRENT
+        // rows and the outdated list; spec for the busy keys is the
+        // `tool@version` the dialog targets.
         let detail = match &selected_row {
-            Some(row) => tool_detail::render(row, cx).into_any_element(),
+            Some(row) => {
+                let spec = format!("{}@{}", row.name, row.version);
+                let can_upgrade = self
+                    .state
+                    .outdated
+                    .ready()
+                    .is_some_and(|list| list.iter().any(|t| t.name == row.name));
+                tool_detail::render(
+                    cx,
+                    row,
+                    &self.state.tool_info,
+                    self.state.tool_info_tool.as_deref(),
+                    can_upgrade,
+                    self.state.is_busy("use", &spec),
+                    self.state.is_busy("uninstall", &spec),
+                    self.state.is_busy("upgrade", &row.name),
+                )
+                .into_any_element()
+            }
             None => placeholder_detail(cx).into_any_element(),
         };
 

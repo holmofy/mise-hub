@@ -1,7 +1,9 @@
+use mise_core::manage::UsePreview;
 use mise_core::{
     CoreError, Mise, OutdatedTool, ProjectStore, ScopeFilter, ToolEntry, ToolRow, filter_rows,
 };
-use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent};
+use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent, types::ToolInfo};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -77,6 +79,17 @@ pub struct AppState {
     /// Rows of `mise outdated` for the upgrade page, loaded with the current
     /// project root when a project page is selected (global scope otherwise).
     pub outdated: Loadable<Vec<OutdatedTool>>,
+    /// Tool detail from `mise tool <name> --json` for the selected tools-page
+    /// row, loaded asynchronously (see `RootView::load_tool_info`); a failure
+    /// keeps the raw error for the detail pane (rule 9) while basic fields
+    /// from `mise ls` still render.
+    pub tool_info: Loadable<ToolInfo>,
+    /// Which tool `tool_info` belongs to; stale results are dropped.
+    pub tool_info_tool: Option<String>,
+    /// Specs of destructive/long runs currently in flight
+    /// (`"uninstall:node@20"`, `"use:node@20"`, …), used to disable the
+    /// matching action buttons while a run cannot be re-entered safely.
+    pub in_flight: HashSet<String>,
 }
 
 impl AppState {
@@ -95,6 +108,9 @@ impl AppState {
             versions_tool: None,
             terminal: TerminalState::default(),
             outdated: Loadable::Idle,
+            tool_info: Loadable::Idle,
+            tool_info_tool: None,
+            in_flight: HashSet::new(),
         }
     }
 
@@ -174,15 +190,17 @@ impl AppState {
     }
 
     /// Load `mise outdated --json` for the upgrade page: with the current
-    /// project root when a project page is selected, otherwise global (no
-    /// `-C`, per AGENTS.md rule 2). Failures land in `Loadable::Failed` with
-    /// the raw message (rule 9).
+    /// project root when a project page is selected (project scope), global
+    /// scope otherwise (no `-C`, per AGENTS.md rule 2). The scope of THIS
+    /// listing is always the scope `start_upgrade` upgrades in, closing the
+    /// "list global, upgrade project" hole. Failures land in
+    /// `Loadable::Failed` with the raw message (rule 9).
     pub fn refresh_outdated(&mut self) -> Result<(), CoreError> {
         let Some(mise) = &self.mise else {
             return Ok(());
         };
         let root = self.current_project_root();
-        match mise.outdated(root.as_deref()) {
+        match mise.outdated(root.is_none(), root.as_deref()) {
             Ok(tools) => {
                 self.outdated = Loadable::Ready(tools);
                 Ok(())
@@ -196,9 +214,10 @@ impl AppState {
 
     /// Start `mise upgrade` and open a new terminal session for it, exactly
     /// like `start_install`: the caller routes the receiver's events into the
-    /// returned session index via `push_event_to`. `spec == None` upgrades
-    /// everything; the Upgrade page has no project selection, so the run is
-    /// global-scoped (`--global`, no `-C`).
+    /// returned session index via `push_event_to`. Scope follows the current
+    /// selection: a project page upgrades that project (`-C`, no `--global`),
+    /// everything else (Upgrade page, global tools) is global-scope
+    /// (`--global`, no `-C`). `spec == None` upgrades everything.
     pub fn start_upgrade(
         &mut self,
         spec: Option<&str>,
@@ -207,21 +226,18 @@ impl AppState {
         let Some(mise) = &self.mise else {
             return Err(mise_core::CoreError::NotFound);
         };
+        let root = self.current_project_root();
+        let global = root.is_none();
         let title = match spec {
             Some(spec) => format!("upgrade {spec}"),
             None => "upgrade".to_string(),
         };
-        let rx = mise.upgrade_stream(spec, bump, true, None)?;
+        let rx = mise.upgrade_stream(spec, bump, global, root.as_deref())?;
         let session = self.terminal.begin(title);
         Ok((session, rx))
     }
 
-    /// Start `mise install tool@version` (install ONLY — never `mise use`,
-    /// AGENTS.md rule 4) targeting the current project (`-C` is included when
-    /// a project is selected; discover-page installs activate nothing, per
-    /// rule 4), open a new terminal session for it, and hand the caller that
-    /// session's index plus the event receiver; the VIEW routes the stream
-    /// into exactly that session (never "the active one", see rule 2).
+    /// Install the tool@{version} spec: install ONLY — never `mise use` (rule 4)
     pub fn start_install(
         &mut self,
         tool: &str,
@@ -234,6 +250,81 @@ impl AppState {
         let rx = mise.install_stream(tool, version, root.as_deref())?;
         let session = self.terminal.begin(format!("install {tool}@{version}"));
         Ok((session, rx))
+    }
+
+    /// Scope for a `mise use` action (use_dry_run / use_apply_stream):
+    /// project page → project scope; everything else → global scope. This is
+    /// the scope resolution pinned by the apply tests and mirrors which tool
+    /// listing produced the version ("apply to where you see it").
+    pub fn use_scope(&self, global: bool) -> (bool, Option<PathBuf>) {
+        let root = self.current_project_root();
+        (global || root.is_none(), if global { None } else { root })
+    }
+
+    /// The blocking `mise use --dry-run` call for one scope — it runs ON the
+    /// app's background thread (never the UI thread). The scope comes from
+    /// `use_scope` beforehand; this helper only wraps the core call so the
+    /// preview path has a single named seam (testable with a fake runner).
+    pub fn use_preview(
+        mise: &Mise,
+        spec: &str,
+        global: bool,
+        root: Option<&Path>,
+    ) -> Result<UsePreview, CoreError> {
+        mise.use_dry_run(spec, global, root)
+    }
+
+    /// Stream `mise use [--pin] <spec>` and open its terminal session. The
+    /// caller registers/unregisters the run key via `begin_run`/`finish_run`
+    /// so the apply button cannot be re-entered while it streams.
+    pub fn start_use(
+        &mut self,
+        spec: &str,
+        global: bool,
+        pin: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let (global, root) = self.use_scope(global);
+        let rx = mise.use_apply_stream(spec, global, pin, root.as_deref())?;
+        let scope = if global { " (--global)" } else { "" };
+        let session = self.terminal.begin(format!("use {spec}{scope}"));
+        Ok((session, rx))
+    }
+
+    /// Stream `mise uninstall <tool>@<version>` with the current project root
+    /// for `-C` context, and open its terminal session. Only removes the
+    /// installed version — the config entry is NEVER touched (rule 3: writes
+    /// go through mise commands; `uninstall` is machine-side, `use`/`set` is
+    /// config-side and out of this path entirely).
+    pub fn start_uninstall(
+        &mut self,
+        tool: &str,
+        version: &str,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let spec = uninstall_spec(tool, version);
+        let root = self.current_project_root();
+        let rx = mise.uninstall_stream(&spec, root.as_deref())?;
+        let session = self.terminal.begin(format!("uninstall {spec}"));
+        Ok((session, rx))
+    }
+
+    /// Mark a run in flight (`begin_run` before streaming, `finish_run` on
+    /// Exited) so matching action buttons can disable themselves.
+    pub fn begin_run(&mut self, kind: &str, spec: &str) {
+        self.in_flight.insert(run_key(kind, spec));
+    }
+
+    pub fn finish_run(&mut self, kind: &str, spec: &str) {
+        self.in_flight.remove(&run_key(kind, spec));
+    }
+
+    pub fn is_busy(&self, kind: &str, spec: &str) -> bool {
+        self.in_flight.contains(&run_key(kind, spec))
     }
 
     /// The install state of a tool as the UI should present it, per AGENTS.md
@@ -301,6 +392,44 @@ impl AppState {
             Loadable::Ready(entries) => SearchIndex::new(entries.clone()).search(query, limit),
             _ => vec![],
         }
+    }
+}
+
+/// The spec `mise uninstall` receives: `{tool}@{version}`, passed verbatim
+/// (backend prefixes like `npm:prettier` are never split or rewritten).
+pub fn uninstall_spec(tool: &str, version: &str) -> String {
+    format!("{tool}@{version}")
+}
+
+/// The in-flight bookkeeping key for a run kind + spec.
+pub fn run_key(kind: &str, spec: &str) -> String {
+    format!("{kind}:{spec}")
+}
+
+/// State of one open 「应用版本」 flow (tool detail pane / discover versions
+/// pane): which spec, which scope the confirm dialog targets, the pin
+/// choice made inside the dialog, and the `mise use --dry-run` preview the
+/// dialog renders (Loading while the blocking call runs on a background
+/// thread; Failed keeps the raw error, AGENTS.md rule 9). Nothing here ever
+/// writes a config file — the write happens only in `run_use` after the
+/// user confirms in the dialog (rule 4).
+#[derive(Debug, Clone)]
+pub struct ApplyFlow {
+    pub spec: String,
+    pub global: bool,
+    pub pin: bool,
+    pub preview: Loadable<UsePreview>,
+}
+
+/// Which locale key presents the post-apply activation status of a tool, as
+/// a pure function of the refreshed `mise ls` rows: the tool is 已生效
+/// (`tools.active`) when some row of the CURRENT scope lists it `active`,
+/// and 已安装 · 未生效 (`discover.installed_not_active`) otherwise.
+pub fn apply_status_key(active: bool) -> &'static str {
+    if active {
+        "tools.active"
+    } else {
+        "discover.installed_not_active"
     }
 }
 
@@ -983,9 +1112,12 @@ mod upgrade_tests {
 
         state.refresh_outdated().unwrap();
 
+        // The global listing must carry `--global` so the run checks the same
+        // scope that `start_upgrade` upgrades in (no `-C` anywhere — AGENTS.md
+        // rule 2: global calls never carry the project dir).
         assert_eq!(
             seen.lock().unwrap()[0],
-            vec!["outdated".to_string(), "--json".to_string()]
+            vec!["outdated".to_string(), "--json".into(), "--global".into()]
         );
     }
 
@@ -1077,6 +1209,240 @@ mod upgrade_tests {
             },
         ]);
         assert_eq!(state.outdated_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod apply_action_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        stdout: String,
+    }
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(CommandOutput {
+                code: 0,
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn recording_mise() -> (
+        Mise,
+        Arc<Mutex<Vec<Vec<String>>>>,
+        Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let seen_runs = Arc::new(Mutex::new(Vec::new()));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mise::new(
+                "mise".into(),
+                Arc::new(RecordingRunner {
+                    seen: seen_runs.clone(),
+                    stdout: String::new(),
+                }),
+                Arc::new(RecordingStreamer {
+                    seen: seen_streams.clone(),
+                }),
+            ),
+            seen_runs,
+            seen_streams,
+        )
+    }
+
+    /// The apply preview is a plain dry-run: the blocking `mise use --dry-run`
+    /// must carry the PROJECT scope (`-C`, no `--global`) when invoked from a
+    /// project page, exactly like the eventual `use` write would.
+    #[test]
+    fn use_preview_project_scope_passes_dash_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen, _streams) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        let (global, root) = state.use_scope(false);
+        AppState::use_preview(
+            state.mise.as_ref().unwrap(),
+            "node@20",
+            global,
+            root.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "use".to_string(),
+                "--dry-run".to_string(),
+                "node@20".to_string(),
+            ]
+        );
+    }
+
+    /// The apply preview in a project-less context (discover, upgrade, global
+    /// tools) or with an explicit global request is a `--global` dry run with
+    /// no `-C` (AGENTS.md rule 2).
+    #[test]
+    fn use_preview_global_scope_omits_dash_c() {
+        let (mise, seen, _streams) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        let (global, root) = state.use_scope(true);
+        AppState::use_preview(
+            state.mise.as_ref().unwrap(),
+            "node@20",
+            global,
+            root.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "use".to_string(),
+                "--dry-run".to_string(),
+                "--global".to_string(),
+                "node@20".to_string(),
+            ]
+        );
+    }
+
+    /// The apply write keeps the same scope as the preview, and `--pin` is
+    /// inserted after `use` (the pin choice from the confirm dialog).
+    #[test]
+    fn start_use_pins_argv_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, _seen, streams) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        let (session, _rx) = state.start_use("node@20", false, true).unwrap();
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "use".to_string(),
+                "--pin".to_string(),
+                "node@20".to_string(),
+            ]
+        );
+        assert_eq!(state.terminal.sessions[session].title, "use node@20");
+        assert!(state.terminal.visible);
+    }
+
+    // AGENTS.md rule 2 + the spec passed verbatim: backend-prefixed names are
+    // never split or rewritten, and the project root comes first.
+    #[test]
+    fn start_uninstall_pins_spec_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, _seen, streams) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        let (session, _rx) = state.start_uninstall("npm:prettier", "3").unwrap();
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "uninstall".to_string(),
+                "npm:prettier@3".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.terminal.sessions[session].title,
+            "uninstall npm:prettier@3"
+        );
+    }
+
+    /// A per-tool upgrade on a project page stays in THIS project's scope.
+    #[test]
+    fn start_upgrade_project_scope_with_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, _seen, streams) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        state.start_upgrade(Some("node"), false).unwrap();
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "upgrade".to_string(),
+                "node".to_string()
+            ]
+        );
+    }
+
+    /// Rule 4 copy keys: active rows read 已生效, everything else keeps
+    /// 「已安装 · 未生效」 until a successful apply flips the refreshed row.
+    #[test]
+    fn apply_status_key_switches_on_active() {
+        assert_eq!(apply_status_key(true), "tools.active");
+        assert_eq!(apply_status_key(false), "discover.installed_not_active");
+    }
+
+    #[test]
+    fn run_key_combines_kind_and_spec() {
+        assert_eq!(run_key("use", "node@20"), "use:node@20");
+        assert_eq!(
+            run_key("uninstall", "npm:prettier@3"),
+            "uninstall:npm:prettier@3"
+        );
+    }
+
+    #[test]
+    fn uninstall_spec_is_verbatim_tool_at_version() {
+        assert_eq!(uninstall_spec("node", "20"), "node@20");
+        assert_eq!(uninstall_spec("npm:prettier", "3.1"), "npm:prettier@3.1");
+    }
+
+    /// begin/finish/existence circle for the in-flight key, so a run cannot
+    /// be re-entered while streaming and the buttons can disable themselves.
+    #[test]
+    fn begin_run_and_finish_run_drive_is_busy() {
+        let mut state = AppState::new(ProjectStore::default());
+        assert!(!state.is_busy("use", "node@20"));
+        state.begin_run("use", "node@20");
+        assert!(state.is_busy("use", "node@20"));
+        assert!(!state.is_busy("use", "other@1"));
+        state.finish_run("use", "node@20");
+        assert!(!state.is_busy("use", "node@20"));
     }
 }
 

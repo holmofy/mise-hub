@@ -30,11 +30,41 @@ tools:
   scope: Scope
   source: Source
   install_path: Install path
+  status: Status
   active: Active
   inactive: Inactive
   overridden: Overridden
   apply: Apply version
-  apply_m2_note: Not available yet — applying a version is planned for M2
+  apply_ok: Apply
+  apply_confirm_title: Apply version
+  apply_note_project: This applies the version to the CURRENT PROJECT's config.
+  apply_note_global: This applies the version to the GLOBAL config (~/.config/mise/config.toml).
+  apply_pin_choice: Pin mode
+  apply_pin: Pin version (--pin)
+  apply_range: Keep range (default)
+  apply_will_install: Will be installed
+  apply_will_install_none: Nothing to install — writing the config only
+  apply_config_updates: Config file(s) to change
+  apply_config_updates_none: No config file changes
+  apply_raw: mise use --dry-run output
+  apply_preview_loading: Running mise use --dry-run…
+  apply_preview_failed: Preview failed
+  apply_running: Running…
+  apply_unavailable: mise is not available
+  uninstall: Uninstall
+  uninstall_confirm_title: Uninstall version
+  uninstall_confirm_body: >-
+    Uninstall %{spec}? The version is removed from the machine ONLY — config
+    files are NOT changed; an uninstalled version listed in a config will be
+    reinstalled on the next mise run.
+  description: Description
+  url: Homepage
+  backend: Backend
+  installed_versions: Installed versions
+  config_source: Config source
+  info_loading: Loading tool details…
+  info_failed: Failed to load tool details
+  info_unavailable: mise is not available
   empty: No installed tools
   no_match: No tools match this search
   loading: Loading…
@@ -65,7 +95,6 @@ discover:
   installed_at_version: Installed version
   apply_project: Apply to this project
   apply_global: Apply globally
-  apply_m2_note: Not available yet — mise use is planned for M2
   loading_versions: Loading versions…
   versions_failed: Failed to load versions
   versions_unavailable: mise is not available

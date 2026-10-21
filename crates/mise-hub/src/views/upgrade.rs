@@ -56,7 +56,7 @@ pub fn render(
         .small()
         .label(t!("upgrade.all").to_string())
         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-            this.run_upgrade(None, cx);
+            this.run_upgrade(None, this.upgrade_bump, cx);
         }));
     let bump_toggle = Button::new("upgrade-bump")
         .outline()
@@ -229,7 +229,7 @@ fn row_element(cx: &mut Context<RootView>, tool: &OutdatedTool) -> impl IntoElem
                 .small()
                 .label(t!("upgrade.row").to_string())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    this.run_upgrade(Some(name.clone()), cx);
+                    this.run_upgrade(Some(name.clone()), this.upgrade_bump, cx);
                 })),
         )
 }

@@ -33,6 +33,8 @@ fn versions_pane(
     tool: Option<&str>,
     versions: &Loadable<Vec<RemoteVersion>>,
     not_active_version: Option<String>,
+    has_project: bool,
+    apply_busy: bool,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
 
@@ -134,10 +136,49 @@ fn versions_pane(
             .into_any_element(),
     });
 
-    // Rule 4: installing and activating are separate actions.
-    // After an install the tool is on the machine but NOT active; the apply
-    // affordance is honest and explicitly not implemented in M1.
+    // Rule 4: installing and activating are separate actions. After an
+    // install the tool is on the machine but NOT active; the apply buttons
+    // open the SAME preview + confirm flow as the tool detail pane. The
+    // 「应用到项目」 button only renders when a project is actually in
+    // context — without one, a button labeled "this project" would silently
+    // write the global config (dishonest labeling; AGENTS.md rule 2).
     if let Some(version) = not_active_version {
+        let mut actions = div().h_flex().gap_2();
+        if let Some(tool) = tool {
+            let apply_spec = format!("{tool}@{version}");
+            let spec_global = apply_spec.clone();
+            actions = actions.child(
+                Button::new("apply-global")
+                    .outline()
+                    .small()
+                    .disabled(apply_busy)
+                    .label(t!("discover.apply_global").to_string())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.prompt_apply(spec_global.clone(), true, window, cx);
+                    })),
+            );
+            if has_project {
+                let spec_project = apply_spec.clone();
+                actions = actions.child(
+                    Button::new("apply-project")
+                        .outline()
+                        .small()
+                        .disabled(apply_busy)
+                        .label(t!("discover.apply_project").to_string())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.prompt_apply(spec_project.clone(), false, window, cx);
+                        })),
+                );
+            }
+        }
+        if apply_busy {
+            actions = actions.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("tools.apply_running").to_string()),
+            );
+        }
         pane = pane.child(
             div()
                 .v_flex()
@@ -162,31 +203,7 @@ fn versions_pane(
                             version
                         )),
                 )
-                .child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("apply-project")
-                                .outline()
-                                .small()
-                                .disabled(true)
-                                .label(t!("discover.apply_project").to_string()),
-                        )
-                        .child(
-                            Button::new("apply-global")
-                                .outline()
-                                .small()
-                                .disabled(true)
-                                .label(t!("discover.apply_global").to_string()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(t!("discover.apply_m2_note").to_string()),
-                        ),
-                ),
+                .child(actions),
         );
     }
 
@@ -227,6 +244,8 @@ pub fn render(
     versions: &Loadable<Vec<RemoteVersion>>,
     versions_tool: Option<&str>,
     not_active_version: Option<String>,
+    has_project: bool,
+    apply_busy: bool,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
 
@@ -361,6 +380,8 @@ pub fn render(
                     versions_tool,
                     versions,
                     not_active_version,
+                    has_project,
+                    apply_busy,
                 )),
         )
 }

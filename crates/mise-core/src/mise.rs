@@ -71,8 +71,33 @@ impl Mise {
     }
 
     /// Rows of `mise outdated --json`, sorted by tool name.
-    pub fn outdated(&self, project_root: Option<&Path>) -> Result<Vec<OutdatedTool>, CoreError> {
-        let out = self.run(&["outdated", "--json"], project_root)?;
+    ///
+    /// `global == true` checks only the global config's requests (same scope
+    /// as `mise upgrade --global`, which `mise outdated --help` documents as
+    /// `--global`), dropping `-C`; otherwise the run is scoped to
+    /// `project_root` via `-C`.
+    pub fn outdated(
+        &self,
+        global: bool,
+        project_root: Option<&Path>,
+    ) -> Result<Vec<OutdatedTool>, CoreError> {
+        let mut args = self.base_or_global(global, project_root);
+        args.extend(["outdated".into(), "--json".into()]);
+        if global {
+            args.push("--global".into());
+        }
+        let fullargs = args;
+        let out = self.runner.run(&CommandRequest {
+            program: self.program.clone(),
+            args: fullargs,
+            cwd: None,
+        })?;
+        if out.code != 0 {
+            return Err(CoreError::CommandFailed {
+                code: out.code,
+                stderr: out.stderr,
+            });
+        }
         parse_outdated(&out.stdout)
     }
 
@@ -359,7 +384,7 @@ mod tests {
     #[test]
     fn outdated_passes_dash_c_before_subcommand() {
         let (m, seen, _) = mise_rec_stream("{}");
-        m.outdated(Some(Path::new("/proj"))).unwrap();
+        m.outdated(false, Some(Path::new("/proj"))).unwrap();
         assert_eq!(
             seen.lock().unwrap()[0],
             vec!["-C", "/proj", "outdated", "--json"]
@@ -367,10 +392,17 @@ mod tests {
     }
 
     #[test]
-    fn outdated_global_omits_dash_c() {
+    fn outdated_global_omits_dash_c_and_adds_flag() {
+        // `mise outdated --help` (mise 2026.10.15) documents `--global`:
+        // "Only check tools defined in the global config", matching the
+        // `mise upgrade --global` scope, so the global listing and the
+        // global upgrade run use the same scope.
         let (m, seen, _) = mise_rec_stream("{}");
-        m.outdated(None).unwrap();
-        assert_eq!(seen.lock().unwrap()[0], vec!["outdated", "--json"]);
+        m.outdated(true, Some(Path::new("/proj"))).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["outdated", "--json", "--global"]
+        );
     }
 
     #[test]
