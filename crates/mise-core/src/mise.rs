@@ -6,6 +6,7 @@ use crate::registry::parse_registry;
 use crate::remote::parse_remote_versions;
 use crate::runner::{CommandOutput, CommandRequest, CommandRunner, StreamEvent, StreamingRunner};
 use crate::search::{DeepSearchHit, parse_search_table};
+use crate::tasks::{Task, parse_tasks};
 use crate::tools::InstalledSet;
 use crate::types::{RemoteVersion, ToolEntry, ToolInfo};
 use std::path::{Path, PathBuf};
@@ -201,6 +202,36 @@ impl Mise {
         if !spec.is_empty() {
             args.push(spec.into());
         }
+        self.spawn_stream(args)
+    }
+
+    /// Rows of `mise tasks ls --json`, in mise's own order. Task names
+    /// with backend-ish prefixes or colons (file tasks) come back verbatim.
+    pub fn tasks(&self, project_root: Option<&Path>) -> Result<Vec<Task>, CoreError> {
+        let out = self.run(&["tasks", "ls", "--json"], project_root)?;
+        parse_tasks(&out.stdout)
+    }
+
+    /// Streamed `mise [-C dir] run <task>`. The task name is passed
+    /// verbatim; the panel is responsible for surfacing non-zero exits.
+    pub fn run_task_stream(
+        &self,
+        task: &str,
+        project_root: Option<&Path>,
+    ) -> Result<Receiver<StreamEvent>, CoreError> {
+        let mut args = self.base_args(project_root);
+        args.extend(["run".into(), task.into()]);
+        self.spawn_stream(args)
+    }
+
+    /// Streamed `mise [-C dir] watch <task>`.
+    pub fn watch_task_stream(
+        &self,
+        task: &str,
+        project_root: Option<&Path>,
+    ) -> Result<Receiver<StreamEvent>, CoreError> {
+        let mut args = self.base_args(project_root);
+        args.extend(["watch".into(), task.into()]);
         self.spawn_stream(args)
     }
 
@@ -882,5 +913,77 @@ recursively searches directories ... https://github.com/BurntSushi/ripgrep\n";
         let m = Mise::new("mise".into(), Arc::new(Failing), Arc::new(NoopStreamer));
         let err = m.deep_search("ripgrep", None).unwrap_err();
         assert!(matches!(err, CoreError::CommandFailed { code: 2, .. }));
+    }
+
+    // ---- M4-T1: tasks ----
+
+    const TASKS_JSON: &str =
+        r#"[{"name":"build","depends":["lint"],"run":["echo build"]},{"name":"test:unit"}]"#;
+
+    #[test]
+    fn tasks_argv_scoped_and_parsed() {
+        let (m, seen, _) = mise_rec_stream(TASKS_JSON);
+        let ts = m.tasks(Some(Path::new("/proj"))).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["-C", "/proj", "tasks", "ls", "--json"]
+        );
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0].name, "build");
+        assert_eq!(ts[0].depends, vec!["lint"]);
+        assert_eq!(ts[1].name, "test:unit"); // colon name survives verbatim
+    }
+
+    #[test]
+    fn tasks_argv_unscoped() {
+        let (m, seen, _) = mise_rec_stream("[]");
+        m.tasks(None).unwrap();
+        assert_eq!(seen.lock().unwrap()[0], vec!["tasks", "ls", "--json"]);
+    }
+
+    #[test]
+    fn run_task_stream_argv_keeps_task_name_verbatim() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.run_task_stream("test:unit", Some(Path::new("/proj")));
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec!["-C", "/proj", "run", "test:unit"]
+        );
+    }
+
+    #[test]
+    fn watch_task_stream_argv_scoped() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.watch_task_stream("lint", Some(Path::new("/proj")));
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec!["-C", "/proj", "watch", "lint"]
+        );
+    }
+
+    #[test]
+    fn run_and_watch_argv_without_project() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.run_task_stream("lint", None);
+        let _ = m.watch_task_stream("lint", None);
+        assert_eq!(stream.lock().unwrap()[0], vec!["run", "lint"]);
+        assert_eq!(stream.lock().unwrap()[1], vec!["watch", "lint"]);
+    }
+
+    #[test]
+    fn tasks_non_zero_exit_is_command_failed() {
+        struct Failing;
+        impl CommandRunner for Failing {
+            fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+                Ok(CommandOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: "config not trusted".into(),
+                })
+            }
+        }
+        let m = Mise::new("mise".into(), Arc::new(Failing), Arc::new(NoopStreamer));
+        let err = m.tasks(Some(Path::new("/proj"))).unwrap_err();
+        assert!(matches!(err, CoreError::CommandFailed { code: 1, .. }));
     }
 }

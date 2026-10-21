@@ -11,6 +11,7 @@ pub mod remote;
 pub mod runner;
 pub mod search;
 pub mod settings;
+pub mod tasks;
 pub mod tools;
 pub mod types;
 
@@ -29,6 +30,7 @@ pub use remote::parse_remote_versions;
 pub use runner::{CommandOutput, CommandRequest, CommandRunner, ProcessRunner};
 pub use search::{DeepSearchHit, SearchHit, SearchIndex, parse_search_table};
 pub use settings::{AppSettings, default_settings_path};
+pub use tasks::{Task, TaskGraph, build_graph, dependency_order, parse_tasks};
 pub use tools::{InstalledSet, Scope, ScopeFilter, ToolRow, filter_rows};
 pub use types::{ConfigSource, InstalledTool, RemoteVersion, ToolEntry};
 
