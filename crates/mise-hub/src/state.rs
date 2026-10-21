@@ -230,6 +230,10 @@ impl AppState {
     /// app's backup directory (spec §5.4: 写配置前先备份). Fail-closed: an
     /// IO error aborts the write BEFORE any mise command is started.
     pub fn backup_before_write(&mut self, path: &Path) -> Result<(), mise_core::CoreError> {
+        // Reset first: when the target file does not exist yet there is nothing
+        // to back up, and a stale path from a previous write must never be
+        // echoed as if it belonged to this one.
+        self.last_backup = None;
         if let Some(backup) = mise_core::backup_file(path, &self.backup_dir)? {
             self.last_backup = Some(backup);
         }
@@ -2933,6 +2937,37 @@ mod env_write_tests {
                 .any(|l| l.text.contains("backup: ")),
             "terminal shows the backup path, lines={:?}",
             state.terminal.sessions[session].lines
+        );
+    }
+
+    /// A write whose target file does not exist yet (e.g. first `mise use
+    /// --global` with no global config) produces no backup; the stale path
+    /// from a previous write must be cleared so the terminal never echoes a
+    /// backup path that belongs to a different write.
+    #[test]
+    fn backup_before_write_clears_last_backup_when_target_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let (mise, _seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.backup_dir = backups.path().to_path_buf();
+
+        // First call: target exists → backup recorded.
+        std::fs::write(dir.path().join("mise.toml"), b"[tools]\n").unwrap();
+        state
+            .backup_before_write(&dir.path().join("mise.toml"))
+            .unwrap();
+        assert!(state.last_backup.is_some(), "existing file is backed up");
+
+        // Second call: target missing → stale path must be cleared.
+        state
+            .backup_before_write(&backups.path().join("missing.toml"))
+            .unwrap();
+        assert!(
+            state.last_backup.is_none(),
+            "missing target clears the stale backup path, got {:?}",
+            state.last_backup
         );
     }
 
