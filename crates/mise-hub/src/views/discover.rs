@@ -193,6 +193,19 @@ fn versions_pane(
     pane
 }
 
+/// Which locale key applies when a loaded registry yields zero hits:
+/// "the registry itself is empty" (browsing with an empty query) vs "your
+/// search matched nothing" (non-empty query). Returns the key, not the
+/// translated string, so it is testable without a locale context; the render
+/// path wraps it in `t!`.
+fn registry_empty_message(query: &str) -> &'static str {
+    if query.trim().is_empty() {
+        "discover.registry_empty"
+    } else {
+        "discover.no_results"
+    }
+}
+
 /// Render the discover page: a search box over the local registry index,
 /// and the results list. `hits` is already searched/browsed by the caller
 /// (empty query = all entries alphabetically, see `AppState::search`), and
@@ -251,23 +264,35 @@ pub fn render(
         Loadable::Idle | Loadable::Loading => div()
             .flex_1()
             .min_h_0()
-            .child(centered(&theme, t!("discover.loading").to_string()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(Spinner::new().xsmall())
+                    .child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .text_sm()
+                            .child(t!("discover.loading").to_string()),
+                    ),
+            )
             .into_any_element(),
         // Loaded, zero rows. Browsing (empty query) over a loaded registry
         // that yields nothing means the registry itself is empty; a
         // non-empty query is a search that matched nothing.
-        Loadable::Ready(_) if hits.is_empty() => {
-            let message = if query.trim().is_empty() {
-                t!("discover.registry_empty").to_string()
-            } else {
-                t!("discover.no_results").to_string()
-            };
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(centered(&theme, message))
-                .into_any_element()
-        }
+        Loadable::Ready(_) if hits.is_empty() => div()
+            .flex_1()
+            .min_h_0()
+            .child(centered(
+                &theme,
+                t!(registry_empty_message(query)).to_string(),
+            ))
+            .into_any_element(),
         Loadable::Ready(_) => {
             let item_sizes = Rc::new(vec![Size::new(px(0.), px(ROW_HEIGHT)); hits.len()]);
             let installed = installed_names.clone();
@@ -476,4 +501,23 @@ fn centered(theme: &Theme, text: String) -> impl IntoElement {
         .text_color(theme.muted_foreground)
         .text_sm()
         .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registry_empty_message;
+
+    // These tests were written first (the predicate was an inline ternary
+    // inside `render` and could not be exercised): running them without the
+    // helper was the RED state — `error[E0432]: unresolved import
+    // super::registry_empty_message`. The extraction below makes them GREEN.
+
+    /// Pin the exact keys against the locale files so a rename cannot
+    /// silently orphan `discover.registry_empty` / `discover.no_results`.
+    #[test]
+    fn registry_empty_message_keys() {
+        assert_eq!(registry_empty_message(""), "discover.registry_empty");
+        assert_eq!(registry_empty_message("   "), "discover.registry_empty");
+        assert_eq!(registry_empty_message("node"), "discover.no_results");
+    }
 }

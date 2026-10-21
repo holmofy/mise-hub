@@ -11,7 +11,6 @@ use gpui_kit::{App, Window};
 /// Candidate monospace families, cross platform (no hardcoded macOS
 /// assumption): macOS → Menlo, Windows → Consolas, Linux → DejaVu Sans
 /// Mono, with a generic `monospace` fallback last.
-/// fallback last.
 #[allow(dead_code)] // the chain is pinned by the font-chain test below;
 // `monospace_family` applies it platform-wise.
 pub fn monospace_candidates() -> &'static [&'static str] {

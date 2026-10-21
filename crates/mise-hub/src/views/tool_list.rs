@@ -11,6 +11,18 @@ use gpui_kit::*;
 use mise_core::{Scope, ScopeFilter, ToolRow};
 use rust_i18n::t;
 
+/// Which locale key applies when the installed-tools list has zero rows:
+/// "nothing installed at all" (no search active) vs "your search matched
+/// nothing". Returns the key, not the translated string, so it is testable
+/// without a locale context; the render path wraps it in `t!`.
+fn tools_empty_message(searched: bool) -> &'static str {
+    if searched {
+        "tools.no_match"
+    } else {
+        "tools.empty"
+    }
+}
+
 /// A unique key identifying a row within the current list: name + version + scope.
 ///
 /// The same tool can appear twice (once per scope) when a project tool
@@ -107,11 +119,7 @@ pub fn render(
                 .p_4()
                 .text_color(theme.muted_foreground)
                 .text_sm()
-                .child(if searched {
-                    t!("tools.no_match").to_string()
-                } else {
-                    t!("tools.empty").to_string()
-                }),
+                .child(t!(tools_empty_message(searched)).to_string()),
         );
     } else {
         // A tool present in both scopes shows as two rows; the non-active one
@@ -294,5 +302,23 @@ fn active_marker(cx: &Context<RootView>, row: &ToolRow, overridden: bool) -> imp
             .text_xs()
             .text_color(theme.muted_foreground)
             .child(t!("tools.inactive").to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tools_empty_message;
+
+    // These tests write in a RED→GREEN round first: before the helper was
+    // extracted, the predicate was an inline ternary inside `render`, so the
+    // two copy branches were untestable. The helper returns the locale *key*
+    // so the tests do not need a locale context; `render` still applies `t!`.
+
+    /// Pin the exact keys against the locale files so a rename cannot
+    /// silently orphan `tools.empty` / `tools.no_match`.
+    #[test]
+    fn tools_empty_message_keys() {
+        assert_eq!(tools_empty_message(false), "tools.empty");
+        assert_eq!(tools_empty_message(true), "tools.no_match");
     }
 }

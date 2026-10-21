@@ -12,33 +12,45 @@ All run from the repo root; exact output below.
 (clean — no output, exit 0)
 ```
 
-### `cargo clippy --workspace --all-targets`
+### `cargo clippy --workspace --all-targets -- -D warnings`
+
+**Re-run at HEAD on 2026-10-21 (fix round 1), replacing the stale
+2026-10-20 note below.** The previous wording said the
+`field_reassign_with_default` warning in `crates/mise-core/src/settings.rs`
+was still open and that `-D warnings` could not pass — that was already wrong
+when written: the same commit range contains the fix
+(`crates/mise-core/src/settings.rs:71-76`). At HEAD the command passes:
 
 ```
-warning: field assignment outside of initializer for an instance created with Default::default()
-  --> crates/mise-core/src/settings.rs:73:9
-warning: `mise-core` (lib test) generated 1 warning
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in ...s
 warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
 ```
 
-Zero warnings in `mise-hub`. The one remaining warning is in
-`crates/mise-core/src/settings.rs`, which is outside Task 14's writable set
-(`crates/mise-core/**` is read-only for this task). `cargo clippy -D warnings`
-is therefore blocked only by that pre-existing mise-core lint.
+Exit 0, zero compiler/clippy warnings in either crate. The only remaining
+note is the upstream `block v0.1.6` future-incompat advisory, which does not
+affect the `-D warnings` gate.
 
 ### `cargo test --workspace`
 
+**Re-run at HEAD on 2026-10-21 (fix round 1):** counts updated for the two
+new empty-state predicate tests (RED→GREEN, see `task-14-report.md`).
+
 ```
 running 28 tests ... test result: ok. 28 passed; 0 failed (mise-core)
-running 29 tests ... test result: ok. 29 passed; 0 failed (mise-hub)
+running 31 tests ... test result: ok. 31 passed; 0 failed (mise-hub)
 running 0 ... test result: ok. 0 passed
 ```
 
+Total: 59 passed, 0 failed.
+
 ### `cargo build --workspace`
+
+**Re-run at HEAD on 2026-10-21 (fix round 1):**
 
 ```
 Finished `dev` profile [unoptimized + debuginfo] target(s)
-(no warnings from mise-hub or mise-core; upstream `block v0.1.6` future-incompat notice only)
+(upstream `block v0.1.6` future-incompat notice only)
 ```
 
 ## GUI terminal cap hardening (automated, not GUI-only)
