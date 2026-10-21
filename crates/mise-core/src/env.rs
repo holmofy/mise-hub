@@ -1,5 +1,9 @@
 //! Environment-variable data layer: parsing of `mise env --json-extended`
 //! and the plain-text `mise set` listing, plus PATH segmentation helpers.
+//!
+//! Note: the mise CLI has no redact flag for variable values, so hiding
+//! secrets is a UI-level hide/show concern only; this layer always returns
+//! raw values.
 
 use crate::error::CoreError;
 use std::path::PathBuf;
@@ -23,6 +27,12 @@ pub struct EnvDeclaration {
     pub name: String,
     pub value: String,
     pub source: PathBuf,
+    /// True when the column layout cannot be recovered with certainty: the
+    /// line contained a multi-space run inside the value region (whitespace
+    /// was collapsed while joining) or more than one token after the name
+    /// looks like a path (the value may itself contain a path). The UI
+    /// should call `Mise::env_value` for an exact read of such rows.
+    pub ambiguous: bool,
 }
 
 /// One entry of `mise env --json-extended` for a single variable. Fields the
@@ -35,6 +45,7 @@ struct RawEnvVar {
     source: String,
     #[serde(default)]
     tool: String,
+    #[serde(default)]
     value: String,
 }
 
@@ -71,9 +82,9 @@ fn non_empty_string(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// True when the last token of the line looks like a config-file path:
-/// it starts with `/`, `~`, or a Windows drive prefix (`X:\`). Those are the
-/// shapes `mise set` uses for its source column.
+/// True when a token looks like a config-file path: it starts with `/`, `~`,
+/// or a Windows drive prefix (`X:\`). Those are the shapes `mise set` uses
+/// for its source column.
 fn looks_like_path(token: &str) -> bool {
     token.starts_with('/')
         || token.starts_with('~')
@@ -83,35 +94,100 @@ fn looks_like_path(token: &str) -> bool {
             && token.as_bytes()[0].is_ascii_alphabetic())
 }
 
+/// A whitespace-delimited token together with its byte range in the line.
+struct Token<'a> {
+    start: usize,
+    end: usize,
+    text: &'a str,
+}
+
+fn tokenize_with_offsets(line: &str) -> Vec<Token<'_>> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = start.take() {
+                tokens.push(Token {
+                    start: s,
+                    end: idx,
+                    text: &line[s..idx],
+                });
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(Token {
+            start: s,
+            end: line.len(),
+            text: &line[s..],
+        });
+    }
+    tokens
+}
+
 /// Parses the plain-text `mise set` listing.
 ///
 /// Layout rule (documented mise behavior, verified on 2026.10.15): each line
 /// is `NAME VALUE… SOURCE`. The first whitespace-delimited token is the name;
-/// the last token is the source if it starts with `/`, `~`, or a Windows drive
-/// prefix (`X:\`); everything between is the value (trimmed). Lines with
-/// fewer than 3 usable tokens are skipped. Because values that themselves
-/// contain a path-shaped token can shift where the source column appears,
-/// `Mise::env_value` (`mise set <NAME>`) exists as the documented fallback
-/// for ambiguous rows.
+/// the source is the RIGHTMOST token after the name that starts with `/`,
+/// `~`, or a Windows drive prefix (`X:\`) — everything before it is the value
+/// (odd look of `mise set P` when the value itself is path-shaped). Source
+/// paths may contain spaces (macOS `/…/my dir/mise.toml`, Windows
+/// `C:\Users\John Smith\…\mise.toml`), so every remaining token from the
+/// source onward is joined back together. Empty values are preserved; a line
+/// with a name but no path token anywhere is skipped.
+///
+/// Because whitespace inside the value is collapsed and path-shaped values can
+/// shift where the source column begins, [`EnvDeclaration::ambiguous`] marks
+/// rows whose layout cannot be recovered with certainty;
+/// `Mise::env_value` (`mise set <NAME>`) is the documented fallback for an
+/// exact read.
 pub fn parse_set_list(text: &str) -> Result<Vec<EnvDeclaration>, CoreError> {
     let mut rows = Vec::new();
     for line in text.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 3 {
+        let tokens = tokenize_with_offsets(line);
+        if tokens.len() < 2 {
             continue;
         }
-        let name = tokens[0];
-        let last = tokens[tokens.len() - 1];
-        if !looks_like_path(last) {
-            // Without a path-shaped last token there is no source column;
-            // the row is ambiguous, skip it.
+        let name = tokens[0].text;
+        // Rightmost path-shaped token at index >= 1 is the source column.
+        let Some(i) = tokens[1..]
+            .iter()
+            .rposition(|t| looks_like_path(t.text))
+            .map(|p| p + 1)
+        else {
+            // No path token anywhere => no recoverable source column; skip.
             continue;
-        }
-        let value = tokens[1..tokens.len() - 1].join(" ");
+        };
+        let value = tokens[1..i]
+            .iter()
+            .map(|t| t.text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source = tokens[i..]
+            .iter()
+            .map(|t| t.text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Ambiguous when: a multi-space run collapses inside the value region
+        // (strictly between value tokens), or the value itself contains
+        // another path-shaped token.
+        let collapsed = tokens[1..i].windows(2).any(|pair| {
+            line.get(pair[0].end..pair[1].start)
+                .is_some_and(|gap| gap.chars().all(char::is_whitespace) && gap.chars().count() >= 2)
+        });
+        let multiple_paths = tokens[1..]
+            .iter()
+            .filter(|t| looks_like_path(t.text))
+            .count()
+            > 1;
         rows.push(EnvDeclaration {
             name: name.to_string(),
             value,
-            source: PathBuf::from(last),
+            source: PathBuf::from(source),
+            ambiguous: collapsed || multiple_paths,
         });
     }
     Ok(rows)
@@ -245,6 +321,58 @@ NAME_ONLY justvalue
     fn set_list_skips_too_few_tokens() {
         let rows = parse_set_list(SET_TABLE).unwrap();
         assert_eq!(rows.iter().filter(|r| r.name == "NAME_ONLY").count(), 0);
+    }
+
+    #[test]
+    fn set_list_spaced_source_path() {
+        // Source directory contains a space: the whole tail after the
+        // rightmost path token is joined back into the source.
+        let rows = parse_set_list("SPACED  v1  /a b/mise.toml\n").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "SPACED");
+        assert_eq!(rows[0].value, "v1");
+        assert_eq!(rows[0].source, PathBuf::from("/a b/mise.toml"));
+        assert!(!rows[0].ambiguous);
+    }
+
+    #[test]
+    fn set_list_empty_value_is_kept() {
+        // `mise set EMPTY` (no value) prints a 2-token row; it must not be
+        // skipped.
+        let rows = parse_set_list("EMPTY  /proj/mise.toml\n").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "EMPTY");
+        assert_eq!(rows[0].value, "");
+        assert_eq!(rows[0].source, PathBuf::from("/proj/mise.toml"));
+        assert!(!rows[0].ambiguous);
+    }
+
+    #[test]
+    fn set_list_path_shaped_value() {
+        // The value itself is path-shaped; the RIGHTMOST path token is the
+        // source, everything between name and source is the value.
+        let rows = parse_set_list("P  /usr/local/bin  /a b/mise.toml\n").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "P");
+        assert_eq!(rows[0].value, "/usr/local/bin");
+        assert_eq!(rows[0].source, PathBuf::from("/a b/mise.toml"));
+        // The value may itself contain a path => ambiguous.
+        assert!(rows[0].ambiguous);
+    }
+
+    #[test]
+    fn set_list_collapsed_whitespace_is_ambiguous() {
+        // A double space inside the value was collapsed while joining.
+        let rows = parse_set_list("GAPPY  a  b  /proj/mise.toml\n").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, "a b");
+        assert!(rows[0].ambiguous);
+    }
+
+    #[test]
+    fn set_list_row_without_path_token_is_skipped() {
+        let rows = parse_set_list("NO_PATH  just value\n").unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
