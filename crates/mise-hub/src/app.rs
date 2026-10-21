@@ -1,7 +1,7 @@
 use crate::i18n;
 use crate::state::{AppState, Loadable, Selection};
 use crate::theme;
-use crate::views::{discover, setup, sidebar, terminal, tool_detail, tool_list};
+use crate::views::{discover, setup, sidebar, terminal, tool_detail, tool_list, upgrade};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::StyledExt;
@@ -42,6 +42,8 @@ pub struct RootView {
     /// (keystrokes) do not jump the list back to the top.
     pub discover_scroll: VirtualListScrollHandle,
     pub notice: Option<String>,
+    /// The 「包含超出配置范围的版本（--bump）」 toggle on the upgrade page.
+    pub upgrade_bump: bool,
     _search_subscription: Subscription,
     _discover_subscription: Subscription,
 }
@@ -94,6 +96,7 @@ impl RootView {
             discover_last_query: String::new(),
             discover_scroll: VirtualListScrollHandle::new(),
             notice: None,
+            upgrade_bump: false,
             _search_subscription: search_subscription,
             _discover_subscription: discover_subscription,
         };
@@ -125,6 +128,12 @@ impl RootView {
             self.state.installed = Loadable::Loading;
             self.refresh_installed();
         }
+        if matches!(self.state.selection, Selection::Upgrade) {
+            // Same loading marker: a slow `mise outdated` must not be read
+            // as "everything is up to date" while it is still running.
+            self.state.outdated = Loadable::Loading;
+            self.refresh_outdated();
+        }
         cx.notify();
     }
 
@@ -140,6 +149,16 @@ impl RootView {
         match self.state.refresh_installed() {
             Ok(()) => {}
             Err(e) => self.state.installed = Loadable::Failed(e.to_string()),
+        }
+    }
+
+    /// Refresh the outdated list, keeping the raw error in `Loadable::Failed`
+    /// (AGENTS.md rule 9). Setting `Loading` first is the caller's job (the
+    /// pane or `select`), mirroring `installed`.
+    pub(crate) fn refresh_outdated(&mut self) {
+        match self.state.refresh_outdated() {
+            Ok(()) => {}
+            Err(e) => self.state.outdated = Loadable::Failed(e.to_string()),
         }
     }
 
@@ -244,6 +263,67 @@ impl RootView {
                         // Refresh only on completion: rule 4 — after the
                         // install finished the panel can honestly show
                         // 「已安装 · 未生效」 with the apply actions exposed.
+                        this.refresh_installed();
+                    }
+                    cx.notify();
+                })
+                .ok();
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Start `mise upgrade` (spec = None for 全部升级, Some(name) for a single
+    /// row) and stream its output into a NEW terminal session, like
+    /// `run_install`. When the run exits, both the outdated list and the
+    /// installed list are refreshed so the page and the badge reflect the
+    /// upgrade that just happened.
+    pub(crate) fn run_upgrade(&mut self, spec: Option<String>, cx: &mut Context<Self>) {
+        let bump = self.upgrade_bump;
+        let (session, rx) = match self.state.start_upgrade(spec.as_deref(), bump) {
+            Ok((session, rx)) => (session, rx),
+            Err(e) => {
+                // Surface the raw error inside its own terminal tab, as a
+                // failed run (AGENTS.md rule 9), not a silent nothing.
+                let session = self.state.terminal.begin(match &spec {
+                    Some(spec) => format!("upgrade {spec}"),
+                    None => "upgrade".to_string(),
+                });
+                self.state
+                    .terminal
+                    .push_event_to(session, StreamEvent::Stderr(e.to_string()));
+                self.state
+                    .terminal
+                    .push_event_to(session, StreamEvent::Exited(-1));
+                cx.notify();
+                return;
+            }
+        };
+
+        let (tx, async_rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            for event in rx {
+                if tx.send_blocking(event).is_err() {
+                    break;
+                }
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = async_rx.recv().await {
+                let done = matches!(event, StreamEvent::Exited(_));
+                this.update(cx, |this, cx| {
+                    this.state.terminal.push_event_to(session, event.clone());
+                    if done {
+                        // Refresh only on completion: the upgrade run changed
+                        // what is installed AND what counts as outdated, so
+                        // the page rows and the sidebar badge must both catch
+                        // up ("available upgrades" must not go stale).
+                        this.state.outdated = Loadable::Loading;
+                        this.refresh_outdated();
                         this.refresh_installed();
                     }
                     cx.notify();
@@ -395,6 +475,10 @@ impl RootView {
                     true
                 })
         });
+    }
+
+    fn upgrade_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        upgrade::render(cx, &self.state.outdated, self.upgrade_bump)
     }
 
     fn tools_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -602,6 +686,7 @@ impl Render for RootView {
                 self.tools_pane(cx).into_any_element()
             }
             Selection::Discover => self.discover_pane(cx).into_any_element(),
+            Selection::Upgrade => self.upgrade_pane(cx).into_any_element(),
             _ => div()
                 .flex_1()
                 .h_full()
@@ -671,6 +756,7 @@ impl Render for RootView {
                         &self.state.projects.projects,
                         &self.state.selection,
                         self.projects_collapsed,
+                        self.state.outdated_count(),
                     ))
                     .child(right_col),
             )

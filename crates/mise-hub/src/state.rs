@@ -1,4 +1,6 @@
-use mise_core::{CoreError, Mise, ProjectStore, ScopeFilter, ToolEntry, ToolRow, filter_rows};
+use mise_core::{
+    CoreError, Mise, OutdatedTool, ProjectStore, ScopeFilter, ToolEntry, ToolRow, filter_rows,
+};
 use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,6 +8,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     Discover,
+    Upgrade,
     GlobalTools,
     GlobalTasks,
     GlobalEnv,
@@ -71,6 +74,9 @@ pub struct AppState {
     pub versions_tool: Option<String>,
     /// Bottom terminal panel sessions.
     pub terminal: TerminalState,
+    /// Rows of `mise outdated` for the upgrade page, loaded with the current
+    /// project root when a project page is selected (global scope otherwise).
+    pub outdated: Loadable<Vec<OutdatedTool>>,
 }
 
 impl AppState {
@@ -88,6 +94,7 @@ impl AppState {
             versions: Loadable::Idle,
             versions_tool: None,
             terminal: TerminalState::default(),
+            outdated: Loadable::Idle,
         }
     }
 
@@ -158,6 +165,55 @@ impl AppState {
         let set = mise.installed(root.as_deref())?;
         self.installed = Loadable::Ready(set.rows(root.as_deref()));
         Ok(())
+    }
+
+    /// Number of outdated tools for the sidebar badge; zero while unknown so
+    /// the badge stays hidden until the upgrade page actually loaded data.
+    pub fn outdated_count(&self) -> usize {
+        self.outdated.ready().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Load `mise outdated --json` for the upgrade page: with the current
+    /// project root when a project page is selected, otherwise global (no
+    /// `-C`, per AGENTS.md rule 2). Failures land in `Loadable::Failed` with
+    /// the raw message (rule 9).
+    pub fn refresh_outdated(&mut self) -> Result<(), CoreError> {
+        let Some(mise) = &self.mise else {
+            return Ok(());
+        };
+        let root = self.current_project_root();
+        match mise.outdated(root.as_deref()) {
+            Ok(tools) => {
+                self.outdated = Loadable::Ready(tools);
+                Ok(())
+            }
+            Err(e) => {
+                self.outdated = Loadable::Failed(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Start `mise upgrade` and open a new terminal session for it, exactly
+    /// like `start_install`: the caller routes the receiver's events into the
+    /// returned session index via `push_event_to`. `spec == None` upgrades
+    /// everything; the Upgrade page has no project selection, so the run is
+    /// global-scoped (`--global`, no `-C`).
+    pub fn start_upgrade(
+        &mut self,
+        spec: Option<&str>,
+        bump: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let title = match spec {
+            Some(spec) => format!("upgrade {spec}"),
+            None => "upgrade".to_string(),
+        };
+        let rx = mise.upgrade_stream(spec, bump, true, None)?;
+        let session = self.terminal.begin(title);
+        Ok((session, rx))
     }
 
     /// Start `mise install tool@version` (install ONLY — never `mise use`,
@@ -439,7 +495,6 @@ mod install_tests {
     use mise_core::{CommandOutput, CommandRequest, CommandRunner};
     use std::sync::mpsc::Receiver;
     use std::sync::{Arc, Mutex};
-
     struct RecordingRunner;
     impl CommandRunner for RecordingRunner {
         fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
@@ -828,6 +883,200 @@ mod registry_load_tests {
         let mut state = AppState::new(ProjectStore::default());
         state.ensure_registry().unwrap();
         assert_eq!(state.registry, Loadable::Idle);
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        stdout: String,
+    }
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(CommandOutput {
+                code: 0,
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn outdated_json() -> String {
+        r#"{"node":{"name":"node","requested":"20","current":"20.10.0","latest":"20.20.2","source":{"path":"/proj/mise.toml"}}}"#.into()
+    }
+
+    // Multi-line return type only to keep clippy's type-complexity lint off
+    // the two recording buffers this fixture hands back to each test.
+    #[allow(clippy::type_complexity)]
+    fn recording_mise(
+        stdout: String,
+    ) -> (
+        Mise,
+        Arc<Mutex<Vec<Vec<String>>>>,
+        Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let seen_runs = Arc::new(Mutex::new(Vec::new()));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mise::new(
+                "mise".into(),
+                Arc::new(RecordingRunner {
+                    seen: seen_runs.clone(),
+                    stdout,
+                }),
+                Arc::new(RecordingStreamer {
+                    seen: seen_streams.clone(),
+                }),
+            ),
+            seen_runs,
+            seen_streams,
+        )
+    }
+
+    // AGENTS.md rule 2: `outdated` (a -C subcommand) must carry the selected
+    // project root in front of the subcommand.
+    #[test]
+    fn refresh_outdated_uses_project_root_for_project_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen, _streams) = recording_mise(outdated_json());
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        state.refresh_outdated().unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["-C".to_string(), id, "outdated".into(), "--json".into()]
+        );
+        let tools = state.outdated.ready().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "node");
+    }
+
+    #[test]
+    fn refresh_outdated_omits_root_globally() {
+        let (mise, seen, _streams) = recording_mise("{}".into());
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        state.refresh_outdated().unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["outdated".to_string(), "--json".to_string()]
+        );
+    }
+
+    // AGENTS.md rule 9: bad JSON must land in `Loadable::Failed` with the raw
+    // error, never panic and never silently become an empty list.
+    #[test]
+    fn refresh_outdated_failure_keeps_raw_error() {
+        let (mise, _seen, _streams) = recording_mise("not json".into());
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+
+        assert!(state.refresh_outdated().is_err());
+        assert!(matches!(state.outdated, Loadable::Failed(_)));
+        assert_eq!(state.outdated_count(), 0);
+    }
+
+    #[test]
+    fn refresh_outdated_without_mise_leaves_idle() {
+        let mut state = AppState::new(ProjectStore::default());
+        state.refresh_outdated().unwrap();
+        assert_eq!(state.outdated, Loadable::Idle);
+    }
+
+    // The Upgrade page never sits on a project selection (Selection::Upgrade
+    // carries no project id), so the run is global-scope: `--global`, no `-C`.
+    #[test]
+    fn start_upgrade_pins_global_argv_and_opens_session() {
+        let (mise, _seen, streams) = recording_mise("{}".into());
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::Upgrade;
+
+        let (session, _rx) = state.start_upgrade(Some("node"), false).unwrap();
+        assert_eq!(session, 0);
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "upgrade".to_string(),
+                "--global".to_string(),
+                "node".to_string()
+            ]
+        );
+        assert!(state.terminal.visible);
+        assert_eq!(state.terminal.sessions.len(), 1);
+        assert_eq!(state.terminal.sessions[0].title, "upgrade node");
+        assert!(matches!(
+            state.terminal.sessions[0].status,
+            RunStatus::Running
+        ));
+    }
+
+    #[test]
+    fn start_upgrade_all_pins_bump_and_no_spec() {
+        let (mise, _seen, streams) = recording_mise("{}".into());
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::Upgrade;
+
+        let (session, _rx) = state.start_upgrade(None, true).unwrap();
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "upgrade".to_string(),
+                "--bump".to_string(),
+                "--global".to_string(),
+            ]
+        );
+        assert_eq!(state.terminal.sessions[session].title, "upgrade");
+    }
+
+    #[test]
+    fn outdated_count_is_zero_unless_ready() {
+        let mut state = AppState::new(ProjectStore::default());
+        assert_eq!(state.outdated_count(), 0);
+        state.outdated = Loadable::Ready(vec![
+            OutdatedTool {
+                name: "node".into(),
+                requested: None,
+                current: None,
+                latest: Some("20.20.2".into()),
+                source_path: None,
+            },
+            OutdatedTool {
+                name: "python".into(),
+                requested: None,
+                current: None,
+                latest: Some("3.13".into()),
+                source_path: None,
+            },
+        ]);
+        assert_eq!(state.outdated_count(), 2);
     }
 }
 

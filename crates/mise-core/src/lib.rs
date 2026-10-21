@@ -18,7 +18,7 @@ pub use install::{ProcessStreamer, StreamEvent, StreamingRunner};
 pub use locator::{default_candidates, locate_in, locate_mise};
 pub use manage::{UsePreview, parse_use_dry_run};
 pub use mise::Mise;
-pub use outdated::parse_outdated;
+pub use outdated::{OutdatedTool, parse_outdated};
 pub use project::{Project, ProjectStore, default_store_path};
 pub use registry::parse_registry;
 pub use remote::parse_remote_versions;

@@ -15,6 +15,7 @@ pub fn render(
     projects: &[Project],
     selection: &Selection,
     collapsed: bool,
+    outdated_count: usize,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
 
@@ -34,6 +35,7 @@ pub fn render(
         Selection::Discover,
         selection,
         &theme,
+        0,
     ));
     col = col.child(nav_item(
         cx,
@@ -41,6 +43,15 @@ pub fn render(
         Selection::GlobalTools,
         selection,
         &theme,
+        0,
+    ));
+    col = col.child(nav_item(
+        cx,
+        t!("nav.upgrade").to_string(),
+        Selection::Upgrade,
+        selection,
+        &theme,
+        outdated_count,
     ));
     col = col.child(nav_item(
         cx,
@@ -48,6 +59,7 @@ pub fn render(
         Selection::GlobalTasks,
         selection,
         &theme,
+        0,
     ));
     col = col.child(nav_item(
         cx,
@@ -55,6 +67,7 @@ pub fn render(
         Selection::GlobalEnv,
         selection,
         &theme,
+        0,
     ));
 
     col = col.child(project_header(cx, collapsed, &theme));
@@ -84,6 +97,7 @@ fn nav_item(
     selection: Selection,
     current: &Selection,
     theme: &Theme,
+    count: usize,
 ) -> impl IntoElement {
     let selected = current == &selection;
     // Click handling lives on `StatefulInteractiveElement`, so the div needs an
@@ -100,13 +114,36 @@ fn nav_item(
         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
             this.select(selection.clone(), cx);
         }))
-        .child(label)
+        .child(
+            // Count badge (upgrade page): a number pill on the right, hidden
+            // entirely when the count is zero so an empty badge never lies.
+            div()
+                .h_flex()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .child(label)
+                .when(count > 0, |d| {
+                    d.child(
+                        div()
+                            .min_w_4()
+                            .px_1p5()
+                            .rounded_full()
+                            .text_xs()
+                            .text_center()
+                            .text_color(theme.background)
+                            .bg(theme.info)
+                            .child(count.to_string()),
+                    )
+                }),
+        )
 }
 
 /// A stable, unique string for one `Selection`, used to build element ids.
 fn selection_id(selection: &Selection) -> String {
     match selection {
         Selection::Discover => "discover".into(),
+        Selection::Upgrade => "upgrade".into(),
         Selection::GlobalTools => "global-tools".into(),
         Selection::GlobalTasks => "global-tasks".into(),
         Selection::GlobalEnv => "global-env".into(),

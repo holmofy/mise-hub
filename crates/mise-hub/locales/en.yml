@@ -5,6 +5,7 @@ common:
 nav:
   workbench: Workbench
   discover: Discover
+  upgrade: Upgrade
   tools: Tools
   tasks: Tasks
   env: Environment
@@ -39,6 +40,15 @@ tools:
   loading: Loading…
   failed: Failed to load tools
   select_tool: Select a tool
+upgrade:
+  count: "%{n} upgrade(s) available"
+  all: Upgrade all
+  row: Upgrade
+  bump: Include out-of-range versions (--bump)
+  source: Source
+  loading: Checking for outdated tools…
+  empty: Nothing to upgrade
+  failed: Failed to load outdated tools
 discover:
   search: Search tools (English keywords)
   search_note: Local search matches English keywords only. Deep search (mise search --all, online) is not implemented until M2.

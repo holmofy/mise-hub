@@ -5,6 +5,7 @@ common:
 nav:
   workbench: 工作台
   discover: 发现
+  upgrade: 升级
   tools: 工具
   tasks: 任务
   env: 环境
@@ -39,6 +40,15 @@ tools:
   loading: 加载中…
   failed: 加载工具失败
   select_tool: 选择一个工具
+upgrade:
+  count: "%{n} 个可升级"
+  all: 全部升级
+  row: 升级
+  bump: 包含超出配置范围的版本（--bump）
+  source: 来源
+  loading: 正在检查可升级项…
+  empty: 没有需要升级的工具
+  failed: 加载可升级列表失败
 discover:
   search: 搜索工具（英文关键词）
   search_note: 本地搜索仅匹配英文关键词；「深度搜索」需联网执行 mise search --all，本里程碑未实现。
