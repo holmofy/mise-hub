@@ -79,6 +79,12 @@ pub struct AppState {
     /// Rows of `mise outdated` for the upgrade page, loaded with the current
     /// project root when a project page is selected (global scope otherwise).
     pub outdated: Loadable<Vec<OutdatedTool>>,
+    /// The scope the `outdated` snapshot was taken in: `Some("global")` after
+    /// a global listing, `Some(<project root>)` after a project-scope listing,
+    /// `None` before any listing finished. Per-tool upgrade visibility must
+    /// match this against the CURRENT scope, or a stale snapshot from one
+    /// page would gate actions that run in another (scope consistency).
+    pub outdated_scope: Option<String>,
     /// Tool detail from `mise tool <name> --json` for the selected tools-page
     /// row, loaded asynchronously (see `RootView::load_tool_info`); a failure
     /// keeps the raw error for the detail pane (rule 9) while basic fields
@@ -108,6 +114,7 @@ impl AppState {
             versions_tool: None,
             terminal: TerminalState::default(),
             outdated: Loadable::Idle,
+            outdated_scope: None,
             tool_info: Loadable::Idle,
             tool_info_tool: None,
             in_flight: HashSet::new(),
@@ -189,6 +196,27 @@ impl AppState {
         self.outdated.ready().map(|v| v.len()).unwrap_or(0)
     }
 
+    /// The scope key `outdated` / `outdated_from_current_scope` are matched
+    /// against: `Some(<project root>)` on a project page, `Some("global")`
+    /// everywhere else (Selection::Upgrade carries no project id, so the
+    /// upgrade listing and the upgrade run are both global — rule 2).
+    pub fn outdated_scope_key(&self) -> Option<String> {
+        match self.current_project_root() {
+            Some(root) => Some(root.to_string_lossy().into_owned()),
+            None => Some("global".to_string()),
+        }
+    }
+
+    /// The `outdated` snapshot ONLY when it was taken in the CURRENT scope:
+    /// per-tool upgrade visibility builds on this, so a stale global
+    /// snapshot can never gate a project-scope upgrade (or vice versa).
+    pub fn outdated_from_current_scope(&self) -> Option<&[OutdatedTool]> {
+        if self.outdated_scope != self.outdated_scope_key() {
+            return None;
+        }
+        self.outdated.ready().map(|v| v.as_slice())
+    }
+
     /// Load `mise outdated --json` for the upgrade page: with the current
     /// project root when a project page is selected (project scope), global
     /// scope otherwise (no `-C`, per AGENTS.md rule 2). The scope of THIS
@@ -203,6 +231,10 @@ impl AppState {
         match mise.outdated(root.is_none(), root.as_deref()) {
             Ok(tools) => {
                 self.outdated = Loadable::Ready(tools);
+                // Tag the snapshot with its scope so per-tool upgrade
+                // visibility can never be driven by another page's stale
+                // listing (rule consistency: list and run share the scope).
+                self.outdated_scope = self.outdated_scope_key();
                 Ok(())
             }
             Err(e) => {
@@ -1139,6 +1171,56 @@ mod upgrade_tests {
         let mut state = AppState::new(ProjectStore::default());
         state.refresh_outdated().unwrap();
         assert_eq!(state.outdated, Loadable::Idle);
+    }
+
+    /// The snapshot must be tagged with its scope: project listing → the
+    /// project root, global listing → "global". Per-tool upgrade visibility
+    /// matches the CURRENT scope against this tag, so a stale snapshot from
+    /// one page can never gate an action that runs in another scope.
+    #[test]
+    fn refresh_outdated_tags_snapshot_with_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let root = projects.projects[0].path.to_string_lossy().into_owned();
+        let (mise, _seen, _streams) = recording_mise(outdated_json());
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+
+        state.selection = Selection::ProjectTools(id);
+        state.refresh_outdated().unwrap();
+        assert_eq!(state.outdated_scope, Some(root.clone()));
+
+        state.selection = Selection::Upgrade;
+        state.refresh_outdated().unwrap();
+        assert_eq!(state.outdated_scope, Some("global".into()));
+    }
+
+    /// Scope-gated visibility: an outdated snapshot taken in one scope must
+    /// be invisible on a page whose actions would run in another scope.
+    #[test]
+    fn outdated_from_current_scope_requires_matching_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, _seen, _streams) = recording_mise(outdated_json());
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+
+        // Fresh session: scope never loaded → nothing exposed.
+        state.selection = Selection::ProjectTools(id.clone());
+        assert!(state.outdated_from_current_scope().is_none());
+
+        // Load in the project scope → visible on the same project page.
+        state.refresh_outdated().unwrap();
+        let tools = state.outdated_from_current_scope().unwrap();
+        assert_eq!(tools[0].name, "node");
+
+        // Switch to the Upgrade page (global scope): the project snapshot
+        // must NOT gate global-scope actions.
+        state.selection = Selection::Upgrade;
+        assert!(state.outdated_from_current_scope().is_none());
+        assert!(state.outdated_scope != state.outdated_scope_key());
     }
 
     // The Upgrade page never sits on a project selection (Selection::Upgrade

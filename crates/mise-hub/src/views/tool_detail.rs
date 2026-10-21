@@ -302,13 +302,26 @@ pub fn apply_dialog_body(
     // then the raw output verbatim.
     col = col.child(match preview {
         None | Some(Loadable::Loading) | Some(Loadable::Idle) => div()
-            .h_flex()
-            .gap_2()
-            .items_center()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(Spinner::new().xsmall())
-            .child(t!("tools.apply_preview_loading").to_string())
+            .v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(Spinner::new().xsmall())
+                    .child(t!("tools.apply_preview_loading").to_string()),
+            )
+            // Rule 10 honesty: while the dry run has not produced a plan,
+            // OK cannot write anything — say so explicitly.
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("tools.apply_preview_pending_note").to_string()),
+            )
             .into_any_element(),
         Some(Loadable::Failed(err)) => div()
             .v_flex()
@@ -318,6 +331,12 @@ pub fn apply_dialog_body(
                     .text_xs()
                     .text_color(theme.danger)
                     .child(t!("tools.apply_preview_failed").to_string()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("tools.apply_preview_pending_note").to_string()),
             )
             .child(div().text_xs().child(err))
             .into_any_element(),

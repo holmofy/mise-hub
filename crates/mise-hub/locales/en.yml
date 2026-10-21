@@ -38,7 +38,7 @@ tools:
   apply_ok: Apply
   apply_confirm_title: Apply version
   apply_note_project: This applies the version to the CURRENT PROJECT's config.
-  apply_note_global: This applies the version to the GLOBAL config (~/.config/mise/config.toml).
+  apply_note_global: This applies the version to the GLOBAL mise config (the global configuration file mise manages, not the project's).
   apply_pin_choice: Pin mode
   apply_pin: Pin version (--pin)
   apply_range: Keep range (default)
@@ -49,6 +49,7 @@ tools:
   apply_raw: mise use --dry-run output
   apply_preview_loading: Running mise use --dry-run…
   apply_preview_failed: Preview failed
+  apply_preview_pending_note: No confirmed plan yet — confirming now will NOT write anything.
   apply_running: Running…
   apply_unavailable: mise is not available
   uninstall: Uninstall

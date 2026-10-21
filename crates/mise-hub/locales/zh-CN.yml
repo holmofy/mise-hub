@@ -38,7 +38,7 @@ tools:
   apply_ok: 应用
   apply_confirm_title: 应用版本
   apply_note_project: 这将把该版本写入当前项目的配置。
-  apply_note_global: 这将把该版本写入全局配置（~/.config/mise/config.toml）。
+  apply_note_global: 这将把该版本写入 mise 的全局配置（由 mise 管理的全局配置文件，而非项目配置）。
   apply_pin_choice: 固定方式
   apply_pin: 固定版本（--pin）
   apply_range: 保留版本范围（默认）
@@ -49,6 +49,7 @@ tools:
   apply_raw: mise use --dry-run 原始输出
   apply_preview_loading: 正在执行 mise use --dry-run…
   apply_preview_failed: 预览失败
+  apply_preview_pending_note: 尚未生成确认的执行计划 — 此时确认不会写入任何配置。
   apply_running: 执行中…
   apply_unavailable: mise 不可用
   uninstall: 卸载

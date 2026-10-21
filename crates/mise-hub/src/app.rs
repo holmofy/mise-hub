@@ -139,12 +139,13 @@ impl RootView {
             // but a slow `mise ls` must not be mistaken for an empty list.
             self.state.installed = Loadable::Loading;
             self.refresh_installed();
+            // Per-tool upgrade actions (spec §6.3) need the outdated list
+            // for THIS page's scope — not a stale snapshot from another page
+            // (scope consistency), so it is loaded here too.
+            self.load_outdated_for_selection(cx);
         }
         if matches!(self.state.selection, Selection::Upgrade) {
-            // Same loading marker: a slow `mise outdated` must not be read
-            // as "everything is up to date" while it is still running.
-            self.state.outdated = Loadable::Loading;
-            self.refresh_outdated();
+            self.load_outdated_for_selection(cx);
         }
         cx.notify();
     }
@@ -166,12 +167,67 @@ impl RootView {
 
     /// Refresh the outdated list, keeping the raw error in `Loadable::Failed`
     /// (AGENTS.md rule 9). Setting `Loading` first is the caller's job (the
-    /// pane or `select`), mirroring `installed`.
+    /// pane or `select`), mirroring `installed`. Used only as the post-run
+    /// refresh (the result lands synchronously after the run already ended,
+    /// so blocking a tokio-free UI thread for the tail of an upgrade run is
+    /// acceptable there); page navigation uses `load_outdated_for_selection`.
     pub(crate) fn refresh_outdated(&mut self) {
         match self.state.refresh_outdated() {
             Ok(()) => {}
             Err(e) => self.state.outdated = Loadable::Failed(e.to_string()),
         }
+    }
+
+    /// The tools page and the upgrade page BOTH need `mise outdated`
+    /// for their current scope (the upgrade page to list rows, the tools page
+    /// to show the per-tool upgrade action — spec §6.3). The blocking call
+    /// runs on a background thread (bridge pattern of `select_discover_tool`);
+    /// the result is stored only while the selection's scope is still the one
+    /// it was fetched for, so a slow global listing can never fill a project
+    /// page (scope consistency).
+    pub(crate) fn load_outdated_for_selection(&mut self, cx: &mut Context<Self>) {
+        let expected = match self.state.outdated_scope_key() {
+            Some(key) => key,
+            None => return,
+        };
+        // Coalesce: a fetch for this exact scope already settled (Ready) or
+        // is running (Loading) → nothing to do; Failed refetches on reselect.
+        if self.state.outdated_scope.as_deref() == Some(expected.as_str())
+            && matches!(self.state.outdated, Loadable::Loading | Loadable::Ready(_))
+        {
+            return;
+        }
+        let Some(mise) = self.state.mise.clone() else {
+            return;
+        };
+        self.state.outdated = Loadable::Loading;
+        cx.notify();
+
+        let root = self.state.current_project_root();
+        let global = root.is_none();
+        let (tx, rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            let result = mise.outdated(global, root.as_deref());
+            tx.send_blocking(result).ok();
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    // Stale-result guard: only apply while the selection's
+                    // scope is still the one this fetch was started for.
+                    if this.state.outdated_scope_key().as_deref() == Some(expected.as_str()) {
+                        this.state.outdated = match result {
+                            Ok(tools) => Loadable::Ready(tools),
+                            Err(e) => Loadable::Failed(e.to_string()),
+                        };
+                        this.state.outdated_scope = Some(expected);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Pick a tool on the discover page and START loading its remote
@@ -243,7 +299,23 @@ impl RootView {
         {
             return;
         }
+        self.fetch_tool_info(tool, cx);
+    }
 
+    /// Re-fetch the info of the tool currently shown in the detail pane,
+    /// used after an apply / uninstall / upgrade finished: `config_source`
+    /// and `installed_versions` would otherwise go stale. A success result
+    /// for a tool that is no longer the visible row is dropped by the
+    /// render-side staleness check.
+    pub(crate) fn refresh_tool_info(&mut self, cx: &mut Context<Self>) {
+        if let Some(tool) = self.state.tool_info_tool.clone() {
+            self.fetch_tool_info(tool, cx);
+        }
+    }
+
+    /// Start the `mise tool <name> --json` fetch (no coalescing — the
+    /// callers own that decision).
+    fn fetch_tool_info(&mut self, tool: String, cx: &mut Context<Self>) {
         self.state.tool_info_tool = Some(tool.clone());
         self.state.tool_info = Loadable::Loading;
         cx.notify();
@@ -342,6 +414,7 @@ impl RootView {
         // and reads the live flow through the weak entity, so the preview
         // appears in place and the pin toggle stays reactive.
         let weak = cx.weak_entity();
+        let expected = spec.clone();
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let weak = weak.clone();
             alert
@@ -356,21 +429,35 @@ impl RootView {
                 })
                 .ok_text(t!("tools.apply_ok").to_string())
                 .cancel_text(t!("nav.cancel").to_string())
-                .on_ok(move |_, _, cx| {
-                    if let Some(view) = weak.upgrade() {
-                        view.update(cx, |this, cx| {
-                            if let Some(flow) = this.apply_flow.take() {
-                                // Only a ready preview may proceed: a failed
-                                // or still-loading preview closes with
-                                // nothing written.
-                                if matches!(flow.preview, Loadable::Ready(_)) {
-                                    this.run_use(&flow.spec, flow.global, flow.pin, cx);
+                .on_ok({
+                    // The dialog builder re-runs on every rebuild, so each
+                    // build needs its own copy of the captured spec (same
+                    // pattern as `prompt_remove_project`'s on_ok).
+                    let expected = expected.clone();
+                    move |_, _, cx| {
+                        if let Some(view) = weak.upgrade() {
+                            view.update(cx, |this, cx| {
+                                // Only the flow this dialog was opened for
+                                // may proceed: if a different dialog is
+                                // open now, OK here writes nothing.
+                                let is_this_dialog =
+                                    this.apply_flow.as_ref().is_some_and(|f| f.spec == expected);
+                                // Only the flow this dialog was opened for
+                                // may proceed: a mismatched or replayed OK
+                                // writes nothing.
+                                if is_this_dialog && let Some(flow) = this.apply_flow.take() {
+                                    // Only a ready preview may proceed:
+                                    // a failed or still-loading preview
+                                    // closes with nothing written.
+                                    if matches!(flow.preview, Loadable::Ready(_)) {
+                                        this.run_use(&flow.spec, flow.global, flow.pin, cx);
+                                    }
                                 }
-                            }
-                            cx.notify();
-                        });
+                                cx.notify();
+                            });
+                        }
+                        true
                     }
-                    true
                 })
         });
     }
@@ -394,11 +481,14 @@ impl RootView {
         self.stream_to_terminal(
             session,
             rx,
-            move |this, _cx| {
+            move |this, cx| {
                 this.state.finish_run("use", &done_spec);
                 this.state.outdated = Loadable::Loading;
                 this.refresh_outdated();
                 this.refresh_installed();
+                // Applied versions/config move: re-enrich the detail pane
+                // (config source + installed versions must not go stale).
+                this.refresh_tool_info(cx);
             },
             cx,
         );
@@ -458,9 +548,12 @@ impl RootView {
         self.stream_to_terminal(
             session,
             rx,
-            move |this, _cx| {
+            move |this, cx| {
                 this.state.finish_run("uninstall", &done_spec);
                 this.refresh_installed();
+                // The uninstalled version disappears from
+                // `installed_versions` in the detail pane.
+                this.refresh_tool_info(cx);
             },
             cx,
         );
@@ -580,10 +673,15 @@ impl RootView {
             Err(e) => {
                 // Surface the raw error inside its own terminal tab, as a
                 // failed run (AGENTS.md rule 9), not a silent nothing.
-                let session = self.state.terminal.begin(match &spec {
-                    Some(spec) => format!("upgrade {spec}"),
-                    None => "upgrade".to_string(),
-                });
+                // For a named spec this routes through `spawn_error_session`
+                // so the `begin_run` key taken above is released — without
+                // it the per-tool upgrade button would stay disabled
+                // forever after one failed spawn.
+                if let Some(name) = &spec {
+                    self.spawn_error_session(name.clone(), "upgrade", e, cx);
+                    return;
+                }
+                let session = self.state.terminal.begin("upgrade".to_string());
                 self.state
                     .terminal
                     .push_event_to(session, StreamEvent::Stderr(e.to_string()));
@@ -599,7 +697,7 @@ impl RootView {
         self.stream_to_terminal(
             session,
             rx,
-            move |this, _cx| {
+            move |this, cx| {
                 if let Some(name) = &done_spec {
                     this.state.finish_run("upgrade", name);
                 }
@@ -610,6 +708,9 @@ impl RootView {
                 this.state.outdated = Loadable::Loading;
                 this.refresh_outdated();
                 this.refresh_installed();
+                // An upgrade changed installed versions: re-enrich the
+                // detail pane if one is open.
+                this.refresh_tool_info(cx);
             },
             cx,
         );
@@ -833,10 +934,12 @@ impl RootView {
         let detail = match &selected_row {
             Some(row) => {
                 let spec = format!("{}@{}", row.name, row.version);
+                // Scope-gated: the tool must be outdated in the CURRENT
+                // scope — a stale global snapshot must never offer an
+                // upgrade that would run project-scope (or vice versa).
                 let can_upgrade = self
                     .state
-                    .outdated
-                    .ready()
+                    .outdated_from_current_scope()
                     .is_some_and(|list| list.iter().any(|t| t.name == row.name));
                 tool_detail::render(
                     cx,
