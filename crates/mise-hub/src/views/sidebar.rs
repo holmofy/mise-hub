@@ -209,11 +209,12 @@ fn project_item(
 ) -> impl IntoElement {
     let id = project.id.clone();
     let name = project.name.clone();
-    // Any per-project page (tools / env; tasks arrives in M4) keeps the row
-    // highlighted — losing highlight on the env page would read as dead UI.
+    // Any per-project page (tools / tasks / env) keeps the row highlighted
+    // — losing highlight on a subpage would read as dead UI.
     let selected = selection.project_id() == Some(id.as_str());
     let click_id = id.clone();
     let env_id = id.clone();
+    let tasks_id = id.clone();
 
     div()
         .h_flex()
@@ -242,6 +243,17 @@ fn project_item(
                         .text_ellipsis()
                         .child(name.clone()),
                 ),
+        )
+        .child(
+            // Per-project 任务 entry (M4): opens that project's tasks page.
+            Button::new(format!("project-tasks-{}", id))
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(AssetIconName::ListTodo))
+                .tooltip(t!("nav.tasks_project").to_string())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.select(Selection::ProjectTasks(tasks_id.clone()), cx);
+                })),
         )
         .child(
             // Per-project 环境 entry: opens that project's env page (the

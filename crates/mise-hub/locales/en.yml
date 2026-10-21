@@ -10,6 +10,7 @@ nav:
   tasks: Tasks
   env: Environment
   env_project: Project environment
+  tasks_project: Project tasks
   projects: Projects
   add_project: Add project
   remove_project: Remove project
@@ -118,6 +119,41 @@ terminal:
 trust:
   banner: mise config at %{path} is not trusted
   button: Trust this config
+tasks:
+  filter: Filter tasks
+  show_hidden: Show hidden tasks
+  hide_hidden: Hide hidden tasks
+  loading: Loading tasks…
+  failed: Failed to load tasks
+  empty: No tasks in this scope
+  no_match: No task matches this filter
+  select_task: Select a task
+  hidden_marker: hidden
+  deps_count: "%{n} dependencies"
+  dependents_count: depended on by %{n}
+  run: Run
+  run_running: Running…
+  run_commands: Run commands (task.run)
+  watch: Watch
+  watching: Watching
+  watching_state: watching for changes
+  watch_stop_note: >-
+    mise-hub cannot stop a running watch — the CLI stream has no stop or
+    kill handle. The watch ends when the process exits (e.g. after a config
+    change or when mise stops it); it also ends when the app quits.
+  dependencies: Dependencies
+  depends: required before the task (depends)
+  depends_post: run after the task, even on failure (depends_post)
+  wait_for: delay start only — not run by mise (wait_for)
+  chain: Execution order
+  chain_empty: No dependencies — the task runs alone
+  chain_cycle: in a cycle
+  chain_missing: not defined in this scope
+  cycle_warn: '"%{task}" is part of a dependency cycle'
+  cycle_hint: >-
+    The task can reach itself through depends/depends_post, so mise can
+    never finish the chain. Inspect the dependency lists below before
+    running.
 env:
   tab_declarations: Declarations
   tab_effective: Effective

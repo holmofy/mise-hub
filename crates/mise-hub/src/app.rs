@@ -1,7 +1,9 @@
 use crate::i18n;
 use crate::state::{AppState, ApplyFlow, EnvTab, Loadable, Selection, resolved_env_name};
 use crate::theme;
-use crate::views::{discover, env, setup, sidebar, terminal, tool_detail, tool_list, upgrade};
+use crate::views::{
+    discover, env, setup, sidebar, tasks, terminal, tool_detail, tool_list, upgrade,
+};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::StyledExt;
@@ -13,7 +15,7 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use mise_core::{AppSettings, CoreError, ScopeFilter, SearchHit, StreamEvent, ToolRow};
+use mise_core::{AppSettings, CoreError, ScopeFilter, SearchHit, StreamEvent, TaskGraph, ToolRow};
 use rust_i18n::t;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -63,6 +65,9 @@ pub struct RootView {
     pub env_expanded: HashSet<String>,
     /// 生效 tab filter input (separate entity; the tabs keep their text).
     pub env_filter_input: Entity<InputState>,
+    /// Tasks-page filter input (its own entity; the query text survives
+    /// page switches like the other list filters do).
+    pub tasks_filter_input: Entity<InputState>,
     /// One open 「新增 / 编辑变量」 dialog: its input entities (created ONCE
     /// before opening — dialog rebuilds must not lose editing state, the
     /// gpui-kit docs insist), the name being edited (None = adding), and the
@@ -73,6 +78,8 @@ pub struct RootView {
     _env_dialog_subscriptions: Vec<Subscription>,
     _search_subscription: Subscription,
     _discover_subscription: Subscription,
+    /// Keyboard events of the tasks-page filter input must trigger redraws.
+    _tasks_filter_subscription: Subscription,
 }
 
 /// Local state of the open 「新增 / 编辑变量」 dialog. The input entities are
@@ -144,6 +151,17 @@ impl RootView {
             },
         );
 
+        let tasks_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("tasks.filter").to_string()));
+        let tasks_filter_subscription = cx.subscribe(
+            &tasks_filter_input,
+            |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        );
+
         let mut this = Self {
             state,
             settings,
@@ -163,10 +181,12 @@ impl RootView {
             env_revealed: HashSet::new(),
             env_expanded: HashSet::new(),
             env_filter_input,
+            tasks_filter_input,
             env_dialog: None,
             _env_dialog_subscriptions: vec![env_filter_subscription],
             _search_subscription: search_subscription,
             _discover_subscription: discover_subscription,
+            _tasks_filter_subscription: tasks_filter_subscription,
         };
         // Mark the installed list as loading before the (synchronous) refresh
         // so a slow `mise ls` reads as "loading", not as "no tools installed".
@@ -207,6 +227,15 @@ impl RootView {
         }
         if matches!(self.state.selection, Selection::Upgrade) {
             self.load_outdated_for_selection(cx);
+        }
+        // Tasks pages: reset the detail selection (a task of the previous
+        // page must not stay "selected" on the next one) and load the list.
+        if matches!(
+            self.state.selection,
+            Selection::GlobalTasks | Selection::ProjectTasks(_)
+        ) {
+            self.state.selected_task = None;
+            self.load_tasks_for_selection(cx);
         }
         // Env pages: reset the per-page view state and load both scopes'
         // data for the diff view; values of another scope must not bleed.
@@ -326,6 +355,138 @@ impl RootView {
             }
         })
         .detach();
+    }
+
+    // -------------------------------------------------------------------
+    // Tasks page (M4-T2 / M4-T3)
+    // -------------------------------------------------------------------
+
+    /// Load `mise tasks ls --json` for the CURRENT scope: the project root
+    /// on a project tasks page, global scope otherwise. The blocking call
+    /// runs on a background thread; the result is applied only while the
+    /// selection's scope is still the one the fetch was started for (the
+    /// same stale-guard pattern as `load_outdated_for_selection`). A
+    /// failure keeps the raw error in `Loadable::Failed` (rule 9) and feeds
+    /// the trust banner.
+    pub(crate) fn load_tasks_for_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(expected) = self.state.tasks_scope_key() else {
+            return;
+        };
+        // Coalesce via the shared pure predicate: reuse a Ready snapshot of
+        // the same scope, or an in-flight fetch for the SAME scope.
+        if !AppState::should_load_outdated(
+            self.state.tasks_in_flight.as_deref(),
+            self.state.tasks_scope.as_deref(),
+            matches!(self.state.tasks, Loadable::Ready(_)),
+            &expected,
+        ) {
+            return;
+        }
+        let Some(mise) = self.state.mise.clone() else {
+            return;
+        };
+        self.state.tasks_in_flight = Some(expected.clone());
+        // A slow listing must not read as "no tasks": mark loading first.
+        self.state.tasks = Loadable::Loading;
+        cx.notify();
+
+        let root = self.state.current_project_root();
+        let (tx, rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            let result = mise.tasks(root.as_deref());
+            tx.send_blocking(result).ok();
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    if this.state.tasks_in_flight.as_deref() == Some(expected.as_str()) {
+                        this.state.tasks_in_flight = None;
+                    }
+                    // Stale-result guard: apply only while the selection's
+                    // scope is still the one this fetch was started for.
+                    if this.state.tasks_scope_key().as_deref() == Some(expected.as_str()) {
+                        this.state.tasks = match result {
+                            Ok(rows) => Loadable::Ready(rows),
+                            Err(e) => {
+                                this.state.note_untrusted(&e);
+                                Loadable::Failed(e.to_string())
+                            }
+                        };
+                        this.state.tasks_scope = Some(expected.clone());
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Stream a task run (or `mise watch`) into a NEW terminal session.
+    /// The terminal core behavior covers the failure display: non-zero
+    /// exits land as Failed(code) with stderr rendered raw (rule 9), and
+    /// spawn failures open an error session instead of failing silently.
+    pub(crate) fn run_task(&mut self, task: &str, watch: bool, cx: &mut Context<Self>) {
+        let task = task.to_string();
+        let kind = if watch { "task-watch" } else { "task-run" };
+        self.state.begin_run(kind, &task);
+        let (session, rx) = match self.state.start_task_run(&task, watch) {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Release the in-flight key the failed spawn took, and
+                // surface the raw error in its own terminal tab.
+                self.state.finish_run(kind, &task);
+                if watch {
+                    self.state.finish_task_watch(&task);
+                }
+                let verb = if watch { "watch" } else { "run" };
+                let session = self.state.terminal.begin(format!("{verb} {task}"));
+                self.state
+                    .terminal
+                    .push_event_to(session, StreamEvent::Stderr(e.to_string()));
+                self.state
+                    .terminal
+                    .push_event_to(session, StreamEvent::Exited(-1));
+                cx.notify();
+                return;
+            }
+        };
+        let done_task = task.clone();
+        self.stream_to_terminal(
+            session,
+            rx,
+            move |this, cx| {
+                this.state.finish_run(kind, &done_task);
+                // A watch that exited is no longer 监听中; a plain run has
+                // no entry to remove (finish_task_watch is a no-op for it).
+                this.state.finish_task_watch(&done_task);
+                cx.notify();
+            },
+            cx,
+        );
+    }
+
+    /// Snapshot the tasks-page state once per render for the view.
+    fn tasks_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let graph: Option<TaskGraph> = self.state.current_task_graph();
+        let selected = self.state.selected_task.clone();
+        let run_busy = selected
+            .as_deref()
+            .is_some_and(|name| self.state.is_busy("task-run", name));
+        let watch_running = selected
+            .as_deref()
+            .is_some_and(|name| self.state.task_watch_running(name));
+        tasks::render(
+            cx,
+            &self.tasks_filter_input,
+            self.state.tasks_show_hidden,
+            &self.state.tasks,
+            graph.as_ref(),
+            selected.as_deref(),
+            run_busy,
+            watch_running,
+        )
     }
 
     /// Pick a tool on the discover page and START loading its remote
@@ -1822,15 +1983,9 @@ impl Render for RootView {
             Selection::Discover => self.discover_pane(cx).into_any_element(),
             Selection::Upgrade => self.upgrade_pane(cx).into_any_element(),
             Selection::GlobalEnv | Selection::ProjectEnv(_) => self.env_pane(cx).into_any_element(),
-            _ => div()
-                .flex_1()
-                .h_full()
-                .items_center()
-                .justify_center()
-                .text_color(cx.theme().muted_foreground)
-                .text_sm()
-                .child(t!("nav.not_available").to_string())
-                .into_any_element(),
+            Selection::GlobalTasks | Selection::ProjectTasks(_) => {
+                self.tasks_pane(cx).into_any_element()
+            }
         };
 
         // The notice banner renders at the root, above the right pane, on

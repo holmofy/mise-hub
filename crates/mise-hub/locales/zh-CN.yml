@@ -10,6 +10,7 @@ nav:
   tasks: 任务
   env: 环境
   env_project: 项目环境
+  tasks_project: 项目任务
   projects: 项目
   add_project: 添加项目
   remove_project: 移除项目
@@ -116,6 +117,39 @@ terminal:
 trust:
   banner: mise 配置未受信任：%{path}
   button: 信任此配置
+tasks:
+  filter: 筛选任务
+  show_hidden: 显示隐藏任务
+  hide_hidden: 不显示隐藏任务
+  loading: 正在加载任务…
+  failed: 加载任务失败
+  empty: 当前范围没有任务
+  no_match: 没有符合筛选条件的任务
+  select_task: 选择一个任务
+  hidden_marker: 隐藏
+  deps_count: "%{n} 个依赖"
+  dependents_count: 被 %{n} 个任务依赖
+  run: 运行
+  run_running: 运行中…
+  run_commands: 运行命令（task.run）
+  watch: 监听
+  watching: 监听中
+  watching_state: 正在监听变更
+  watch_stop_note: >-
+    mise-hub 无法停止运行中的监听——CLI 流没有停止 / 终止句柄。监听会随
+    进程退出而结束（例如 mise 在配置变更后自行退出），退出应用也会结束它。
+  dependencies: 依赖
+  depends: 任务之前运行（depends）
+  depends_post: 任务之后运行，失败也执行（depends_post）
+  wait_for: 仅延迟启动——mise 不会运行它（wait_for）
+  chain: 执行顺序
+  chain_empty: 无依赖——任务单独运行
+  chain_cycle: 处于依赖环中
+  chain_missing: 本范围内未定义
+  cycle_warn: '「%{task}」处于依赖环中'
+  cycle_hint: >-
+    该任务可以通过 depends / depends_post 访问到自身，mise 无法完成这条
+    链。请先检查下方的依赖列表，再决定是否运行。
 env:
   tab_declarations: 声明
   tab_effective: 生效

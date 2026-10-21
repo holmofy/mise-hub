@@ -155,6 +155,25 @@ pub struct AppState {
     /// rows, fetched on the user's reveal click. Keyed by variable name and
     /// cleared on scope change: values of another scope must not bleed.
     pub env_exact: std::collections::HashMap<String, Loadable<String>>,
+    /// Rows of `mise tasks ls --json` for the CURRENT scope: project root on
+    /// a project tasks page, global otherwise. Loaded asynchronously; a
+    /// failure keeps the raw error (rule 9).
+    pub tasks: Loadable<Vec<mise_core::Task>>,
+    /// The scope key the COMPLETED `tasks` snapshot belongs to, mirroring
+    /// `outdated_scope`; render-side actions must match the CURRENT scope.
+    pub tasks_scope: Option<String>,
+    /// Scope key the IN-FLIGHT `tasks` fetch was started for (same pattern as
+    /// `outdated_in_flight` / `env_in_flight`).
+    pub tasks_in_flight: Option<String>,
+    /// The task selected in the tasks-page detail pane (name, verbatim —
+    /// file tasks like `build:index` are never rewritten).
+    pub selected_task: Option<String>,
+    /// 「显示隐藏任务」 toggle: hidden tasks are filtered OUT by default.
+    pub tasks_show_hidden: bool,
+    /// Session index of the still-running `mise watch` per task name, so
+    /// the detail pane can show a persistent 监听中 state; entries leave
+    /// when the watch exits.
+    pub task_watch_sessions: std::collections::HashMap<String, usize>,
 }
 
 impl AppState {
@@ -187,6 +206,12 @@ impl AppState {
             env_in_flight: None,
             env_other_declarations: Loadable::Idle,
             env_exact: std::collections::HashMap::new(),
+            tasks: Loadable::Idle,
+            tasks_scope: None,
+            tasks_in_flight: None,
+            selected_task: None,
+            tasks_show_hidden: false,
+            task_watch_sessions: std::collections::HashMap::new(),
         }
     }
 
@@ -565,6 +590,76 @@ impl AppState {
         let rx = mise.unset_env_file_stream(name, file, root.as_deref())?;
         let session = self.terminal.begin(format!("unset {name}"));
         Ok((session, rx))
+    }
+
+    // -------------------------------------------------------------------
+    // Tasks page (M4-T2 / M4-T3)
+    // -------------------------------------------------------------------
+
+    /// The scope key `tasks` snapshots match against, mirroring
+    /// `outdated_scope_key` / `env_scope_key`: `Some(<project root>)` on a
+    /// project tasks page, `Some("global")` everywhere else.
+    pub fn tasks_scope_key(&self) -> Option<String> {
+        match self.current_project_root() {
+            Some(root) => Some(root.to_string_lossy().into_owned()),
+            None => Some("global".to_string()),
+        }
+    }
+
+    /// The loaded task listing ONLY when its scope still is the current one.
+    pub fn tasks_from_current_scope(&self) -> Option<&[mise_core::Task]> {
+        if self.tasks_scope != self.tasks_scope_key() {
+            return None;
+        }
+        self.tasks.ready().map(|v| v.as_slice())
+    }
+
+    /// The dependency graph of the CURRENT scope's task listing (`None`
+    /// while the listing is absent or stale).
+    pub fn current_task_graph(&self) -> Option<mise_core::TaskGraph> {
+        self.tasks_from_current_scope()
+            .map(|tasks| mise_core::build_graph(tasks.to_vec()))
+    }
+
+    /// Streamed `mise [-C dir] run <task>` (verbatim task name; backend
+    /// prefixes and colons are never rewritten) and its terminal session.
+    /// Scope: project tasks page → that project (`-C` first, rule 2),
+    /// global tasks page → global (no `-C`).
+    pub fn start_task_run(
+        &mut self,
+        task: &str,
+        watch: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let root = self.current_project_root();
+        let rx = if watch {
+            mise.watch_task_stream(task, root.as_deref())?
+        } else {
+            mise.run_task_stream(task, root.as_deref())?
+        };
+        let verb = if watch { "watch" } else { "run" };
+        let session = self.terminal.begin(format!("{verb} {task}"));
+        if watch {
+            self.task_watch_sessions.insert(task.to_string(), session);
+        }
+        Ok((session, rx))
+    }
+
+    /// Whether the task's `mise watch` session is still live (used for the
+    /// persistent 监听中 state in the detail pane).
+    pub fn task_watch_running(&self, task: &str) -> bool {
+        self.task_watch_sessions
+            .get(task)
+            .and_then(|ix| self.terminal.sessions.get(*ix))
+            .is_some_and(|s| s.status == RunStatus::Running)
+    }
+
+    /// Drop the watch bookkeeping for a finished watch session (called on
+    /// `Exited`; non-watch (plain run) tasks never occupy an entry).
+    pub fn finish_task_watch(&mut self, task: &str) {
+        self.task_watch_sessions.remove(task);
     }
 }
 
@@ -1254,6 +1349,149 @@ mod search_state_tests {
             .map(|h| h.tool.short)
             .collect();
         assert_eq!(names, vec!["node", "python", "zig"]);
+    }
+}
+
+#[cfg(test)]
+mod task_state_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner;
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            Ok(CommandOutput {
+                code: 0,
+                stdout: "[{\"name\": \"build\"}]".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Records the exact argv of every streamed `mise` invocation so the
+    /// run/watch contract (`-C` scope + verbatim task name) is pinned.
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn project_state() -> (AppState, String, Arc<Mutex<Vec<Vec<String>>>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            (
+                Mise::new(
+                    "mise".into(),
+                    Arc::new(RecordingRunner),
+                    Arc::new(RecordingStreamer { seen: seen.clone() }),
+                ),
+                seen,
+            )
+        };
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTasks(root.clone());
+        (state, root, seen)
+    }
+
+    /// Run argv: `-C <root>` first, `run`, then the verbatim task name (a
+    /// `file` task with a colon must never be split or rewritten).
+    #[test]
+    fn start_task_run_pins_run_argv_for_current_project() {
+        let (mut state, root, seen) = project_state();
+        let (session, _rx) = state.start_task_run("test:unit", false).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root,
+                "run".to_string(),
+                "test:unit".to_string(),
+            ]
+        );
+        // New session, focused, panel visible, title carries the task name.
+        assert!(state.terminal.visible);
+        assert_eq!(state.terminal.sessions[session].title, "run test:unit");
+        assert_eq!(state.terminal.active, session);
+    }
+
+    #[test]
+    fn start_task_watch_pins_watch_argv() {
+        let (mut state, root, seen) = project_state();
+        let (session, _rx) = state.start_task_run("lint", true).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root,
+                "watch".to_string(),
+                "lint".to_string(),
+            ]
+        );
+        assert_eq!(state.terminal.sessions[session].title, "watch lint");
+        // The watch is recorded so the pane can show a persistent 监听中.
+        assert!(state.task_watch_running("lint"));
+        assert!(state.task_watch_running("other").eq(&false));
+    }
+
+    /// Global tasks page: no `-C` at all (rule 2 — the global listing and
+    /// the global run are both without a project context).
+    #[test]
+    fn global_task_run_has_no_dash_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mise, seen) = {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            (
+                Mise::new(
+                    "mise".into(),
+                    Arc::new(RecordingRunner),
+                    Arc::new(RecordingStreamer { seen: seen.clone() }),
+                ),
+                seen,
+            )
+        };
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        let _ = dir; // no project in context
+        state.selection = Selection::GlobalTasks;
+        state.start_task_run("build", false).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["run".to_string(), "build".to_string()]
+        );
+        // Scope keys mirror the outdated/env pattern.
+        assert_eq!(state.tasks_scope_key().as_deref(), Some("global"));
+    }
+
+    /// A finished watch session must leave the 监听中 state (the entry is
+    /// keyed by session status; a dropped record is a no-op).
+    #[test]
+    fn task_watch_running_tracks_session_status() {
+        let (mut state, _, _seen) = project_state();
+        state.start_task_run("lint", true).unwrap();
+        // Push the exit for THIS run's session.
+        let ix = state.task_watch_sessions["lint"];
+        state.terminal.push_event_to(ix, StreamEvent::Exited(0));
+        assert!(state.task_watch_running("lint").eq(&false));
+        assert!(state.task_watch_sessions.contains_key("lint"));
+        state.finish_task_watch("lint");
+        assert!(state.task_watch_sessions.contains_key("lint").eq(&false));
+    }
+
+    #[test]
+    fn tasks_scope_key_matches_project_page() {
+        let (state, root, _) = project_state();
+        assert_eq!(state.tasks_scope_key(), Some(root));
     }
 }
 
