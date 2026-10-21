@@ -1,0 +1,72 @@
+app:
+  name: mise-hub
+common:
+  retry: Retry
+nav:
+  workbench: Workbench
+  discover: Discover
+  tools: Tools
+  tasks: Tasks
+  env: Environment
+  projects: Projects
+  add_project: Add project
+  remove_project: Remove project
+  confirm_remove_title: Remove project
+  confirm_remove_body: Remove this project from the list? The folder on disk is not touched.
+  cancel: Cancel
+  remove: Remove
+  not_available: Not available in this milestone
+setup:
+  title: mise is not installed
+  body: mise-hub needs the mise CLI. Install it, then click Detect again.
+  detect: Detect again
+tools:
+  search_installed: Search installed tools
+  all: All
+  project: This project
+  global: Global
+  version: Version
+  scope: Scope
+  source: Source
+  install_path: Install path
+  active: Active
+  inactive: Inactive
+  overridden: Overridden
+  apply: Apply version
+  apply_m2_note: Not available yet — applying a version is planned for M2
+  empty: No installed tools
+  no_match: No tools match this search
+  loading: Loading…
+  failed: Failed to load tools
+  select_tool: Select a tool
+discover:
+  search: Search tools (English keywords)
+  search_note: Local search matches English keywords only. Deep search (mise search --all, online) is not implemented until M2.
+  deep_search: Deep search
+  deep_search_note: mise search --all is online and ships in M2 — not implemented yet
+  no_results: No tools match this query
+  registry_empty: The tool registry is empty
+  loading: Loading tool registry…
+  failed: Failed to load the tool registry
+  installed: Installed
+  install: Install
+  pick_tool: Pick a tool to see its available versions
+  installed_not_active: Installed · not active yet
+  installed_at_version: Installed version
+  apply_project: Apply to this project
+  apply_global: Apply globally
+  apply_m2_note: Not available yet — mise use is planned for M2
+  loading_versions: Loading versions…
+  versions_failed: Failed to load versions
+  versions_unavailable: mise is not available
+terminal:
+  save: Save
+  copy: Copy
+  clear: Clear
+  save_note: Save the run output to a log file
+  clear_keeps_tab: Clears the output but keeps the run tab
+  running: Running
+  succeeded: Succeeded
+  failed: Failed
+  expand: Show terminal
+  collapse: Collapse
