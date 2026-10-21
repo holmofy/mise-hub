@@ -506,6 +506,8 @@ impl Render for RootView {
         let current_theme = self.settings.theme.clone();
         let current_locale = self.settings.locale.clone();
         let settings_path = self.settings_path.clone();
+        let search_input = self.search_input.clone();
+        let discover_input = self.discover_input.clone();
         let weak = cx.weak_entity();
 
         // Theme picker: lists every registered theme and applies the selection.
@@ -559,7 +561,9 @@ impl Render for RootView {
                                 .on_click({
                                     let weak = weak.clone();
                                     let settings_path = settings_path.clone();
-                                    move |_, _window, cx| {
+                                    let search_input = search_input.clone();
+                                    let discover_input = discover_input.clone();
+                                    move |_, window, cx| {
                                         i18n::set_locale(code);
                                         if let Some(view) = weak.upgrade() {
                                             view.update(cx, |this, cx| {
@@ -568,6 +572,24 @@ impl Render for RootView {
                                                 cx.notify();
                                             });
                                         }
+                                        // The search placeholders were baked into
+                                        // InputState at startup; re-evaluate them
+                                        // from the new locale so they follow the
+                                        // language switch without a restart.
+                                        search_input.update(cx, |input, cx| {
+                                            input.set_placeholder(
+                                                t!("tools.search_installed").to_string(),
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                        discover_input.update(cx, |input, cx| {
+                                            input.set_placeholder(
+                                                t!("discover.search").to_string(),
+                                                window,
+                                                cx,
+                                            )
+                                        });
                                     }
                                 }),
                         )

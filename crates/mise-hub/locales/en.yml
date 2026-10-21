@@ -50,7 +50,6 @@ discover:
   failed: Failed to load the tool registry
   installed: Installed
   install: Install
-  versions: Versions
   pick_tool: Pick a tool to see its available versions
   installed_not_active: Installed · not active yet
   installed_at_version: Installed version

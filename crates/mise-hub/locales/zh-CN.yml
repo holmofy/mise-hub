@@ -50,7 +50,6 @@ discover:
   failed: 加载工具索引失败
   installed: 已安装
   install: 安装
-  versions: 可用版本
   pick_tool: 选择一个工具查看可用版本
   installed_not_active: 已安装 · 未生效
   installed_at_version: 已安装版本
