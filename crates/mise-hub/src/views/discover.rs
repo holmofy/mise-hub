@@ -48,7 +48,8 @@ fn versions_pane(
 
     let title = match tool {
         Some(tool) => tool.to_string(),
-        None => t!("discover.select_to_see_versions").to_string(),
+        // The versions pane's empty state: pick a tool to load versions.
+        None => t!("discover.pick_tool").to_string(),
     };
     pane = pane.child(div().text_sm().font_medium().child(title));
 

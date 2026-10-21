@@ -60,7 +60,7 @@ pub struct AppState {
     /// when this is absent (tests assign the registry directly).
     search_index: Option<SearchIndex>,
     /// Remote versions for the tool the user picked on the discover page.
-    /// Async-filled by the view through `queue_remote_versions`; a failure
+    /// Filled asynchronously by the view (`select_discover_tool`); a failure
     /// keeps the raw error in `Loadable::Failed` for the panel to render.
     pub versions: Loadable<Vec<RemoteVersion>>,
     /// Which tool `versions` belongs to; guards against a stale result
@@ -158,28 +158,30 @@ impl AppState {
     }
 
     /// Start `mise install tool@version` (install ONLY — never `mise use`,
-    /// AGENTS.md rule 4), open a new terminal session for it, and hand the
-    /// event receiver to the caller; the VIEW consumes it on the UI thread.
-    /// Does not touch any UI state beyond the terminal session.
+    /// AGENTS.md rule 4) targeting the current project (`-C` is included when
+    /// a project is selected; discover-page installs activate nothing, per
+    /// rule 4), open a new terminal session for it, and hand the caller that
+    /// session's index plus the event receiver; the VIEW routes the stream
+    /// into exactly that session (never "the active one", see rule 2).
     pub fn start_install(
         &mut self,
         tool: &str,
         version: &str,
-    ) -> Result<std::sync::mpsc::Receiver<StreamEvent>, mise_core::CoreError> {
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
         let Some(mise) = &self.mise else {
             return Err(mise_core::CoreError::NotFound);
         };
         let root = self.current_project_root();
         let rx = mise.install_stream(tool, version, root.as_deref())?;
-        self.terminal.begin(format!("install {tool}@{version}"));
-        Ok(rx)
+        let session = self.terminal.begin(format!("install {tool}@{version}"));
+        Ok((session, rx))
     }
 
     /// The install state of a tool as the UI should present it, per AGENTS.md
     /// rule 4: installing and activating are separate steps. `Some(version)`
     /// means the tool is on the machine but NOT active in the current
-    /// project (discover installs always go global — no `mise.toml` is ever
-    /// written from here).
+    /// project (install never writes config — activation happens only via
+    /// `mise use`, which is out of scope until M2).
     pub fn installed_but_not_active(&self, tool: &str) -> Option<String> {
         let rows = self.installed.ready()?;
         let matching: Vec<&mise_core::ToolRow> = rows.iter().filter(|r| r.name == tool).collect();
@@ -266,11 +268,6 @@ pub enum RunStatus {
 
 #[derive(Debug, Clone)]
 pub struct TerminalSession {
-    /// Unique id (returned by `TerminalState::begin`); not used by the UI
-    /// yet — the tab bar addresses sessions by index — but kept as the
-    /// stable handle for future `terminal.close(id)`.
-    #[allow(dead_code)]
-    pub id: String,
     pub title: String,
     pub lines: Vec<TerminalLine>,
     pub status: RunStatus,
@@ -280,33 +277,31 @@ impl TerminalSession {
     /// Append raw output text to this session, shaped like real process
     /// output: the streamer emits one logical line per event (its `lines()`
     /// already strips the trailing `\n`), ANSI escape sequences are stripped
-    /// so raw codes never reach the user (red line), and a line containing
-    /// carriage returns is a progress update — its final fragment REPLACES
-    /// the previous line instead of appending a new one.
+    /// so raw codes never reach the user (red line), and a `\r`-containing
+    /// progress payload renders only its FINAL fragment — as a new line,
+    /// never rewriting previously completed lines.
     fn feed(&mut self, stream: Stream, text: &str) {
         let clean = strip_ansi(text);
+        // Compute the split count once: recomputing per iteration is O(n²).
+        let line_count = clean.split('\n').count();
         // Allow multi-line payloads: everything before a `\n` is complete.
         for (ix, piece) in clean.split('\n').enumerate() {
-            let is_last = ix == clean.split('\n').count() - 1;
+            let is_last = ix == line_count - 1;
             if is_last && piece.is_empty() && clean.ends_with('\n') {
                 break; // trailing newline: no empty line
             }
-            if piece.contains('\r') {
-                // Progress bar: the last fragment is the visible state.
-                let visible = piece.rsplit('\r').next().unwrap_or("");
-                match self.lines.last_mut() {
-                    Some(line) => line.text = visible.to_string(),
-                    None => self.lines.push(TerminalLine {
-                        stream,
-                        text: visible.to_string(),
-                    }),
-                }
+            // Progress bars arrive WITHIN one event (`"10%\r 50%\r100%"`):
+            // the last fragment is the visible state and becomes its own
+            // line. Earlier completed lines are never mutated.
+            let visible = if piece.contains('\r') {
+                piece.rsplit('\r').next().unwrap_or("")
             } else {
-                self.lines.push(TerminalLine {
-                    stream,
-                    text: piece.to_string(),
-                });
-            }
+                piece
+            };
+            self.lines.push(TerminalLine {
+                stream,
+                text: visible.to_string(),
+            });
         }
     }
 }
@@ -319,19 +314,19 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-    /// Open a new run, focus it, and make the panel visible. Ids are unique
-    /// (tabs are addressed by index; titles may repeat).
-    pub fn begin(&mut self, title: impl Into<String>) -> String {
-        let id = format!("term-{}", self.sessions.len() + 1);
+    /// Open a new run, focus it, make the panel visible, and return that
+    /// session's INDEX — a stable handle for routing the run's events via
+    /// `push_event_to`, immune to later tab clicks or concurrent runs.
+    pub fn begin(&mut self, title: impl Into<String>) -> usize {
         self.sessions.push(TerminalSession {
-            id: id.clone(),
             title: title.into(),
             lines: vec![],
             status: RunStatus::Running,
         });
-        self.active = self.sessions.len() - 1;
+        let index = self.sessions.len() - 1;
+        self.active = index;
         self.visible = true;
-        id
+        index
     }
 
     pub fn active_session(&self) -> Option<&TerminalSession> {
@@ -365,8 +360,12 @@ impl TerminalState {
         })
     }
 
-    pub fn push_event(&mut self, event: StreamEvent) {
-        let Some(session) = self.sessions.get_mut(self.active) else {
+    /// Route one stream event into the session at `index` — NOT the active
+    /// one. Two runs may be streaming concurrently and the user may click
+    /// tabs while they run; mis-routing would put one run's output in
+    /// another run's tab. Out-of-range indexes are ignored (never panic).
+    pub fn push_event_to(&mut self, index: usize, event: StreamEvent) {
+        let Some(session) = self.sessions.get_mut(index) else {
             return;
         };
         match event {
@@ -472,7 +471,8 @@ mod install_tests {
         state.mise = Some(Arc::new(mise));
         state.selection = Selection::ProjectTools(root.clone());
 
-        state.start_install("ripgrep", "14.1.0").unwrap();
+        let (session, _rx) = state.start_install("ripgrep", "14.1.0").unwrap();
+        assert_eq!(session, 0);
 
         // AGENTS.md rule 2: `-C <dir>` comes first, then the subcommand.
         assert_eq!(
@@ -515,9 +515,9 @@ mod terminal_tests {
     fn appends_lines_in_order_and_sets_status() {
         let mut term = TerminalState::default();
         term.begin("install ripgrep@14.1.0");
-        term.push_event(StreamEvent::Stdout("downloading".into()));
-        term.push_event(StreamEvent::Stderr("warning".into()));
-        term.push_event(StreamEvent::Exited(0));
+        term.push_event_to(0, StreamEvent::Stdout("downloading".into()));
+        term.push_event_to(0, StreamEvent::Stderr("warning".into()));
+        term.push_event_to(0, StreamEvent::Exited(0));
         let session = term.active_session().unwrap();
         assert_eq!(session.lines.len(), 2);
         assert_eq!(session.lines[0].text, "downloading");
@@ -531,7 +531,7 @@ mod terminal_tests {
     fn non_zero_exit_marks_failure() {
         let mut term = TerminalState::default();
         term.begin("install x");
-        term.push_event(StreamEvent::Exited(1));
+        term.push_event_to(0, StreamEvent::Exited(1));
         assert!(matches!(
             term.active_session().unwrap().status,
             RunStatus::Failed(1)
@@ -545,18 +545,49 @@ mod terminal_tests {
         let mut term = TerminalState::default();
         assert!(!term.visible);
         let first = term.begin("install a@1");
-        term.push_event(StreamEvent::Stdout("one".into()));
+        term.push_event_to(first, StreamEvent::Stdout("one".into()));
         let second = term.begin("install b@2");
-        term.push_event(StreamEvent::Stdout("two".into()));
+        term.push_event_to(second, StreamEvent::Stdout("two".into()));
 
         assert_ne!(first, second);
         assert!(term.visible);
         assert_eq!(term.sessions.len(), 2);
+        assert_eq!(second, term.sessions.len() - 1);
         let session = term.active_session().unwrap();
-        assert_eq!(session.id, second);
         assert_eq!(session.title, "install b@2");
         assert_eq!(session.lines.len(), 1);
         assert_eq!(session.lines[0].text, "two");
+    }
+
+    /// Events must be routed to the session they belong to (a Stable index),
+    /// never to "the active one": with two sessions, output pushed to index
+    /// 0 lands only in session 0, and session 1's status stays untouched
+    /// (blocker: tab clicks / concurrent runs must not cross-contaminate).
+    #[test]
+    fn push_event_to_routes_only_to_target_session() {
+        let mut term = TerminalState::default();
+        let a = term.begin("install a@1");
+        let b = term.begin("install b@2");
+        assert_eq!(term.active, b);
+
+        // Click tab `a` mid-run: `b`'s events must still go to `b` and
+        // `a`'s status must survive `b`'s exit.
+        term.push_event_to(b, StreamEvent::Stdout("b line".into()));
+        term.push_event_to(b, StreamEvent::Exited(0));
+        term.push_event_to(a, StreamEvent::Stderr("a warning".into()));
+
+        let session_a = &term.sessions[a];
+        let session_b = &term.sessions[b];
+        assert_eq!(
+            session_a
+                .lines
+                .iter()
+                .map(|l| (l.stream, l.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(Stream::Stderr, "a warning")]
+        );
+        assert!(matches!(session_a.status, RunStatus::Running));
+        assert!(matches!(session_b.status, RunStatus::Succeeded));
     }
 
     /// AGENTS.md rule 9: events may arrive before any session exists
@@ -564,8 +595,8 @@ mod terminal_tests {
     #[test]
     fn push_event_without_session_is_noop() {
         let mut term = TerminalState::default();
-        term.push_event(StreamEvent::Stdout("orphan".into()));
-        term.push_event(StreamEvent::Exited(0));
+        term.push_event_to(0, StreamEvent::Stdout("orphan".into()));
+        term.push_event_to(0, StreamEvent::Exited(0));
         assert!(term.active_session().is_none());
     }
 
@@ -574,7 +605,7 @@ mod terminal_tests {
     fn trailing_newline_does_not_create_empty_line() {
         let mut term = TerminalState::default();
         term.begin("install x");
-        term.push_event(StreamEvent::Stdout("line one\nline two\n".into()));
+        term.push_event_to(0, StreamEvent::Stdout("line one\nline two\n".into()));
         let session = term.active_session().unwrap();
         assert_eq!(
             session
@@ -586,17 +617,31 @@ mod terminal_tests {
         );
     }
 
-    /// A carriage-return progress update rewrites the tail instead of
-    /// appending a new line.
+    /// A `\r` progress payload arrives WITHIN one event; only its FINAL
+    /// fragment is rendered, as a new line — previously completed lines are
+    /// never overwritten.
     #[test]
-    fn carriage_return_rewrites_partial_line() {
+    fn carriage_render_appends_final_fragment_without_rewriting_history() {
         let mut term = TerminalState::default();
         term.begin("install x");
-        term.push_event(StreamEvent::Stdout("downloading  10%".into()));
-        term.push_event(StreamEvent::Stdout("downloading  50%\rdone!".into()));
+        term.push_event_to(0, StreamEvent::Stdout("downloading  10%".into()));
+        term.push_event_to(0, StreamEvent::Stdout("downloading  50%\rdone!".into()));
         let session = term.active_session().unwrap();
-        assert_eq!(session.lines.len(), 1);
-        assert_eq!(session.lines[0].text, "done!");
+        assert_eq!(
+            session
+                .lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            // The earlier completed line survives; the \r event contributes
+            // one new line holding only its final fragment.
+            vec!["downloading  10%", "done!"]
+        );
+        // Multi-fragment progress within a single event yields one line too.
+        term.push_event_to(0, StreamEvent::Stdout(" 10%\r 50%\r100%".into()));
+        let session = term.active_session().unwrap();
+        assert_eq!(session.lines.len(), 3);
+        assert_eq!(session.lines[2].text, "100%");
     }
 
     /// Red line: install output must never show raw escape codes.

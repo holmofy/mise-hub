@@ -150,6 +150,18 @@ impl RootView {
     /// rendering while versions load. A failure is surfaced verbatim in the
     /// versions panel (AGENTS.md rule 9), never as a blank area.
     pub(crate) fn select_discover_tool(&mut self, tool: String, cx: &mut Context<Self>) {
+        // Coalesce repeat requests (AGENTS.md: 同一工具的重复请求要合并):
+        // a repeated click on the SAME tool must never spawn another
+        // `mise ls-remote`. Reuse an in-flight Loading or an already-Ready
+        // result; only a Failed result refetches on a new click.
+        if self.state.versions_tool.as_deref() == Some(tool.as_str())
+            && matches!(self.state.versions, Loadable::Loading | Loadable::Ready(_))
+        {
+            self.state.selected_tool = Some(tool);
+            cx.notify();
+            return;
+        }
+
         self.state.selected_tool = Some(tool.clone());
         self.state.versions_tool = Some(tool.clone());
         self.state.versions = Loadable::Loading;
@@ -191,18 +203,24 @@ impl RootView {
     /// from core is bridged onto an async channel by a background thread —
     /// the UI thread only awaits, never touching the entity off-thread.
     pub(crate) fn run_install(&mut self, tool: &str, version: &str, cx: &mut Context<Self>) {
-        let rx = match self.state.start_install(tool, version) {
-            Ok(rx) => rx,
+        // Capture the run's OWN session index: streams must be routed into
+        // that session, never "the active one" (concurrent installs and
+        // mid-run tab clicks otherwise corrupt each other's output).
+        let (session, rx) = match self.state.start_install(tool, version) {
+            Ok((session, rx)) => (session, rx),
             Err(e) => {
                 // Surface the raw error inside its own terminal tab, as a
                 // failed run (AGENTS.md rule 9), not a silent nothing.
-                self.state
+                let session = self
+                    .state
                     .terminal
                     .begin(format!("install {tool}@{version}"));
                 self.state
                     .terminal
-                    .push_event(StreamEvent::Stderr(e.to_string()));
-                self.state.terminal.push_event(StreamEvent::Exited(-1));
+                    .push_event_to(session, StreamEvent::Stderr(e.to_string()));
+                self.state
+                    .terminal
+                    .push_event_to(session, StreamEvent::Exited(-1));
                 cx.notify();
                 return;
             }
@@ -221,7 +239,7 @@ impl RootView {
             while let Ok(event) = async_rx.recv().await {
                 let done = matches!(event, StreamEvent::Exited(_));
                 this.update(cx, |this, cx| {
-                    this.state.terminal.push_event(event.clone());
+                    this.state.terminal.push_event_to(session, event.clone());
                     if done {
                         // Refresh only on completion: rule 4 — after the
                         // install finished the panel can honestly show
