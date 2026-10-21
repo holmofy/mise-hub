@@ -85,6 +85,13 @@ pub struct AppState {
     /// match this against the CURRENT scope, or a stale snapshot from one
     /// page would gate actions that run in another (scope consistency).
     pub outdated_scope: Option<String>,
+    /// The scope key the IN-FLIGHT `outdated` fetch was started for (set when
+    /// the fetch spawns, cleared when its result is applied). Tracked
+    /// separately from `outdated_scope` so "a fetch for scope X is running"
+    /// can never be confused with "the completed snapshot belongs to X" —
+    /// a quick B → A → B page switch must not coalesce B's refetch with A's
+    /// in-flight request (fix round 2 of the M2-T3 regression).
+    pub outdated_in_flight: Option<String>,
     /// Tool detail from `mise tool <name> --json` for the selected tools-page
     /// row, loaded asynchronously (see `RootView::load_tool_info`); a failure
     /// keeps the raw error for the detail pane (rule 9) while basic fields
@@ -115,6 +122,7 @@ impl AppState {
             terminal: TerminalState::default(),
             outdated: Loadable::Idle,
             outdated_scope: None,
+            outdated_in_flight: None,
             tool_info: Loadable::Idle,
             tool_info_tool: None,
             in_flight: HashSet::new(),
@@ -207,6 +215,26 @@ impl AppState {
         }
     }
 
+    /// Pure coalesce predicate for the async `outdated` fetch. A new fetch
+    /// must start EXCEPT when one is already in flight for this exact scope
+    /// (`in_flight`, tracked separately from the completed snapshot's scope)
+    /// or when a `Ready` snapshot for the same scope can be reused. This
+    /// decision-point pure helper exists so the B → A → B regression
+    /// (fix round 2) is testable without GPUI: with A's fetch in flight and
+    /// B completed, the caller must refetch B instead of coalescing with
+    /// A's request.
+    pub fn should_load_outdated(
+        in_flight: Option<&str>,
+        completed_scope: Option<&str>,
+        completed_is_ready: bool,
+        expected: &str,
+    ) -> bool {
+        if in_flight == Some(expected) {
+            return false;
+        }
+        completed_scope != Some(expected) || !completed_is_ready
+    }
+
     /// The `outdated` snapshot ONLY when it was taken in the CURRENT scope:
     /// per-tool upgrade visibility builds on this, so a stale global
     /// snapshot can never gate a project-scope upgrade (or vice versa).
@@ -235,6 +263,9 @@ impl AppState {
                 // visibility can never be driven by another page's stale
                 // listing (rule consistency: list and run share the scope).
                 self.outdated_scope = self.outdated_scope_key();
+                // The synchronous refresh owns the fetch end-to-end; any
+                // coalesced in-flight marker is obsolete once it lands.
+                self.outdated_in_flight = None;
                 Ok(())
             }
             Err(e) => {
@@ -1221,6 +1252,36 @@ mod upgrade_tests {
         state.selection = Selection::Upgrade;
         assert!(state.outdated_from_current_scope().is_none());
         assert!(state.outdated_scope != state.outdated_scope_key());
+    }
+
+    // The coalesce predicate for the async outdated fetch, incl. the
+    // fix-round-2 regression: B completed, A's fetch in flight, user back
+    // on B → must refetch B (predicate true), not coalesce with A's fetch.
+    #[test]
+    fn should_load_outdated_coalesce_cases() {
+        // Regression B → A → B: B's snapshot scope is still B, but the
+        // loadable is Loading for A's in-flight fetch → must refetch B.
+        assert!(AppState::should_load_outdated(
+            Some("A"),
+            Some("B"),
+            false,
+            "B"
+        ));
+        // In-flight fetch for the SAME scope → coalesce.
+        assert!(!AppState::should_load_outdated(
+            Some("B"),
+            Some("A"),
+            false,
+            "B"
+        ));
+        // Ready snapshot of the same scope, nothing in flight → reuse.
+        assert!(!AppState::should_load_outdated(None, Some("B"), true, "B"));
+        // Ready snapshot of a DIFFERENT scope → must load.
+        assert!(AppState::should_load_outdated(None, Some("A"), true, "B"));
+        // Failed/Loading snapshot of same scope, nothing in flight → load.
+        assert!(AppState::should_load_outdated(None, Some("B"), false, "B"));
+        // Nothing loaded at all → load.
+        assert!(AppState::should_load_outdated(None, None, false, "B"));
     }
 
     // The Upgrade page never sits on a project selection (Selection::Upgrade

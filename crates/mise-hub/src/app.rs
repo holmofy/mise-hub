@@ -190,17 +190,27 @@ impl RootView {
             Some(key) => key,
             None => return,
         };
-        // Coalesce: a fetch for this exact scope already settled (Ready) or
-        // is running (Loading) → nothing to do; Failed refetches on reselect.
-        if self.state.outdated_scope.as_deref() == Some(expected.as_str())
-            && matches!(self.state.outdated, Loadable::Loading | Loadable::Ready(_))
-        {
+        // Coalesce via the pure predicate: reuse only a Ready snapshot of the
+        // same scope, or an in-flight fetch for the SAME scope (tracked in
+        // `outdated_in_flight`, never `outdated_scope` — the completed
+        // snapshot's scope and the running fetch's scope are unrelated when
+        // the user switches pages mid-fetch, the B → A → B regression).
+        if !AppState::should_load_outdated(
+            self.state.outdated_in_flight.as_deref(),
+            self.state.outdated_scope.as_deref(),
+            matches!(self.state.outdated, Loadable::Ready(_)),
+            &expected,
+        ) {
             return;
         }
         let Some(mise) = self.state.mise.clone() else {
             return;
         };
         self.state.outdated = Loadable::Loading;
+        // Mark the in-flight fetch's scope BEFORE spawning: `outdated_scope`
+        // stays attached to the last COMPLETED snapshot and must not be
+        // confused with the request currently running.
+        self.state.outdated_in_flight = Some(expected.clone());
         cx.notify();
 
         let root = self.state.current_project_root();
@@ -213,6 +223,11 @@ impl RootView {
         cx.spawn(async move |this, cx| {
             if let Ok(result) = rx.recv().await {
                 this.update(cx, |this, cx| {
+                    // Clear the in-flight marker for THIS fetch only; a
+                    // newer fetch may already have overwritten it.
+                    if this.state.outdated_in_flight.as_deref() == Some(expected.as_str()) {
+                        this.state.outdated_in_flight = None;
+                    }
                     // Stale-result guard: only apply while the selection's
                     // scope is still the one this fetch was started for.
                     if this.state.outdated_scope_key().as_deref() == Some(expected.as_str()) {
