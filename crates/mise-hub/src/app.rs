@@ -1,13 +1,14 @@
 use crate::i18n;
-use crate::state::{AppState, ApplyFlow, Loadable, Selection};
+use crate::state::{AppState, ApplyFlow, EnvTab, Loadable, Selection};
 use crate::theme;
-use crate::views::{discover, setup, sidebar, terminal, tool_detail, tool_list, upgrade};
+use crate::views::{discover, env, setup, sidebar, terminal, tool_detail, tool_list, upgrade};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::component::WindowExt;
 use gpui_kit::component::button::{Button, ButtonVariant};
+use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder;
@@ -50,8 +51,43 @@ pub struct RootView {
     /// `ApplyFlow` — the dialog reads this on every rebuild, so the validator
     /// stays honest about what will be written before anything is written.
     pub apply_flow: Option<ApplyFlow>,
+    /// Environment-page tab (声明 / 生效 / 差异). Defaults to 声明.
+    pub env_tab: EnvTab,
+    /// Global 「显示全部」 reveal toggle for sensitive values (default OFF —
+    /// the mask is the contract; see `env::is_revealed`).
+    pub env_show_all: bool,
+    /// Per-row reveal set: names whose values the user explicitly revealed.
+    pub env_revealed: HashSet<String>,
+    /// Per-row expansion set: names whose override chain (other scope's
+    /// declaration + effective value) is shown.
+    pub env_expanded: HashSet<String>,
+    /// 生效 tab filter input (separate entity; the tabs keep their text).
+    pub env_filter_input: Entity<InputState>,
+    /// One open 「新增 / 编辑变量」 dialog: its input entities (created ONCE
+    /// before opening — dialog rebuilds must not lose editing state, the
+    /// gpui-kit docs insist), the name being edited (None = adding), and the
+    /// chosen write scope.
+    pub env_dialog: Option<EnvDialogState>,
+    /// Subscriptions of the open env dialog's inputs (keyboard input must
+    /// revalidate the preview / inline error, i.e. trigger a redraw).
+    _env_dialog_subscriptions: Vec<Subscription>,
     _search_subscription: Subscription,
     _discover_subscription: Subscription,
+}
+
+/// Local state of the open 「新增 / 编辑变量」 dialog. The input entities are
+/// created before the dialog opens and captured here; the dialog builder
+/// (env::edit_dialog_body) reads them through the weak entity so the
+/// preview command and inline error stay live while typing.
+pub struct EnvDialogState {
+    pub name_input: Entity<InputState>,
+    pub value_input: Entity<InputState>,
+    /// The variable being edited, `None` when adding a new one. While
+    /// editing, the name is fixed (rename = unset + set, out of scope here).
+    pub editing: Option<String>,
+    /// `true` = write the global config (`mise set --global`), `false` =
+    /// write the CURRENT PROJECT's config (`mise -C <root> set`).
+    pub scope_global: bool,
 }
 
 impl RootView {
@@ -92,6 +128,17 @@ impl RootView {
                 }
             });
 
+        let env_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("env.filter").to_string()));
+        let env_filter_subscription = cx.subscribe(
+            &env_filter_input,
+            |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        );
+
         let mut this = Self {
             state,
             settings,
@@ -106,6 +153,13 @@ impl RootView {
             notice: None,
             upgrade_bump: false,
             apply_flow: None,
+            env_tab: EnvTab::Declarations,
+            env_show_all: false,
+            env_revealed: HashSet::new(),
+            env_expanded: HashSet::new(),
+            env_filter_input,
+            env_dialog: None,
+            _env_dialog_subscriptions: vec![env_filter_subscription],
             _search_subscription: search_subscription,
             _discover_subscription: discover_subscription,
         };
@@ -148,6 +202,19 @@ impl RootView {
         }
         if matches!(self.state.selection, Selection::Upgrade) {
             self.load_outdated_for_selection(cx);
+        }
+        // Env pages: reset the per-page view state and load both scopes'
+        // data for the diff view; values of another scope must not bleed.
+        if matches!(
+            self.state.selection,
+            Selection::GlobalEnv | Selection::ProjectEnv(_)
+        ) {
+            self.env_tab = EnvTab::Declarations;
+            self.env_show_all = false;
+            self.env_revealed.clear();
+            self.env_expanded.clear();
+            self.state.env_exact.clear();
+            self.load_env_for_selection(cx);
         }
         cx.notify();
     }
@@ -752,6 +819,420 @@ impl RootView {
         self.run_upgrade(Some(name.to_string()), false, cx);
     }
 
+    // -------------------------------------------------------------------
+    // Environment page (M3-T2 / M3-T3)
+    // -------------------------------------------------------------------
+
+    /// Load the env page data for the CURRENT selection scope
+    /// (declarations + effective) and, on a project page, ALSO the global
+    /// declarations (the diff view's 全局 column). Blocking subprocess calls
+    /// run on a background thread; the result is applied only while the
+    /// selection's scope still matches, the same stale-guard pattern as
+    /// `load_outdated_for_selection`. Failures land in `Loadable::Failed`
+    /// with the raw message (rule 9) and feed the trust banner.
+    pub(crate) fn load_env_for_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(expected) = self.state.env_scope_key() else {
+            return;
+        };
+        // Coalesce via the shared pure predicate (same semantics as for
+        // `outdated`): reuse a Ready snapshot of the same scope, or an
+        // in-flight fetch for the SAME scope.
+        if !AppState::should_load_outdated(
+            self.state.env_in_flight.as_deref(),
+            self.state.env_scope.as_deref(),
+            matches!(self.state.env_declarations, Loadable::Ready(_))
+                && matches!(self.state.env_effective, Loadable::Ready(_)),
+            &expected,
+        ) {
+            return;
+        }
+        let Some(mise) = self.state.mise.clone() else {
+            return;
+        };
+
+        self.state.env_in_flight = Some(expected.clone());
+        // A slow listing must not be read as "empty": mark loading first,
+        // same as the installed list does at startup.
+        self.state.env_declarations = Loadable::Loading;
+        self.state.env_effective = Loadable::Loading;
+        // The other scope is loaded only for a project page (there the
+        // ALL-GLOBAL declaration table fills the diff's 全局 column; on a
+        // global page there is no single project to compare against and the
+        // column stays neutral).
+        let fetch_other_scope = self.state.selection.project_id().is_some();
+
+        let root = self.state.current_project_root();
+        let (tx, rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            let declarations = mise.env_declarations(root.as_deref());
+            let effective = mise.env_extended(root.as_deref());
+            // Global scope listing for `mise set` (root = None). Not `--global`:
+            // `set` has no such output flag; the unscoped invocation lists the
+            // Global-scope declarations.
+            let other = if fetch_other_scope {
+                Some(mise.env_declarations(None))
+            } else {
+                None
+            };
+            tx.send_blocking((declarations, effective, other)).ok();
+        });
+        cx.notify();
+
+        let expected = expected.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok((declarations, effective, other)) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    if this.state.env_in_flight.as_deref() == Some(expected.as_str()) {
+                        this.state.env_in_flight = None;
+                    }
+                    // Stale-result guard: apply only while the selection's
+                    // scope is still the one this fetch was started for.
+                    if this.state.env_scope_key().as_deref() == Some(expected.as_str()) {
+                        this.state.env_declarations = match declarations {
+                            Ok(rows) => Loadable::Ready(rows),
+                            Err(e) => {
+                                this.state.note_untrusted(&e);
+                                Loadable::Failed(e.to_string())
+                            }
+                        };
+                        this.state.env_effective = match effective {
+                            Ok(rows) => Loadable::Ready(rows),
+                            Err(e) => {
+                                this.state.note_untrusted(&e);
+                                Loadable::Failed(e.to_string())
+                            }
+                        };
+                        this.state.env_other_declarations = match other {
+                            None => Loadable::Idle,
+                            Some(Ok(rows)) => Loadable::Ready(rows),
+                            Some(Err(e)) => Loadable::Failed(e.to_string()),
+                        };
+                        this.state.env_scope = Some(expected);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Exact re-read (`mise set <NAME>`) for an ambiguous declaration row:
+    /// its parsed value may be off, so the display replaces it with the
+    /// exact value once this async Read finishes.
+    pub(crate) fn load_env_exact(&mut self, name: String, cx: &mut Context<Self>) {
+        // Coalesce: a Loading/Ready exact value is not refetched on repeat.
+        if self
+            .state
+            .env_exact
+            .get(&name)
+            .is_some_and(|s| matches!(s, Loadable::Loading | Loadable::Ready(_)))
+        {
+            return;
+        }
+        let Some(mise) = self.state.mise.clone() else {
+            return;
+        };
+        let root = self.state.current_project_root();
+        self.state.env_exact.insert(name.clone(), Loadable::Loading);
+        cx.notify();
+
+        let (tx, rx) = async_channel::unbounded();
+        let thread_name = name.clone();
+        std::thread::spawn(move || {
+            let result = mise.env_value(&thread_name, root.as_deref());
+            tx.send_blocking(result).ok();
+        });
+        let expected_scope = self.state.env_scope_key();
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    // Apply only while the fetch's scope is still the current
+                    // one (an exact value of another scope must not bleed).
+                    if this.state.env_scope_key() == expected_scope {
+                        this.state.env_exact.insert(
+                            name,
+                            match result {
+                                Ok(v) => Loadable::Ready(v),
+                                Err(e) => Loadable::Failed(e.to_string()),
+                            },
+                        );
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Reveal / re-hide one row's value. Revealing an AMBIGUOUS declaration
+    /// (its parsed value may be off) ALSO starts the exact `mise set <NAME>`
+    /// re-read so the display becomes exact — planned M3-T2 behavior.
+    pub(crate) fn toggle_env_reveal(&mut self, name: &str, cx: &mut Context<Self>) {
+        if !self.env_revealed.remove(name) {
+            self.env_revealed.insert(name.to_string());
+            // Exact read for ambiguous declarations: locate the current
+            // scope's declaration for the name.
+            let ambiguous = self
+                .state
+                .env_declarations
+                .ready()
+                .and_then(|rows| rows.iter().find(|d| d.name == name))
+                .is_some_and(|d| d.ambiguous);
+            if ambiguous {
+                self.load_env_exact(name.to_string(), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Expand / collapse one declaration row's override chain.
+    pub(crate) fn toggle_env_expanded(&mut self, name: &str, cx: &mut Context<Self>) {
+        if !self.env_expanded.remove(name) {
+            self.env_expanded.insert(name.to_string());
+        }
+        cx.notify();
+    }
+
+    /// Copy a value to the clipboard — ONLY when the user can see it
+    /// (per-row reveal or the 显示全部 toggle, `env::copy_allowed`); a hidden
+    /// value refuses with a notice instead of silently landing on the
+    /// clipboard (sensitive-value handling).
+    pub(crate) fn copy_env_value(
+        &mut self,
+        name: &str,
+        raw: &str,
+        show_all: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !env::copy_allowed(show_all, &self.env_revealed, name) {
+            self.notice = Some(t!("env.copy_hidden_warn").to_string());
+            cx.notify();
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(raw.to_string()));
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// Open the 「新增 / 编辑变量」 dialog. The input entities are created
+    /// HERE (before the dialog opens — dialog rebuilds must not recreate
+    /// them); editing pre-fills the value input from the current scope's
+    /// declaration. NOTHING is written by this function; the write is
+    /// `run_set_env` in the dialog's OK handler (rule 3 + rule 10).
+    pub(crate) fn prompt_env_edit(
+        &mut self,
+        editing: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prefilled: Option<String> = editing.clone().and_then(|name| {
+            self.state.env_declarations.ready().and_then(|rows| {
+                rows.iter()
+                    .find(|d| d.name == name)
+                    .map(|d| d.value.clone())
+            })
+        });
+        let has_project = self.state.current_project_root().is_some();
+
+        let name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("env.name").to_string()));
+        let prefill = prefilled.clone();
+        let value_input = cx.new(|cx| {
+            let state = InputState::new(window, cx);
+            match &prefill {
+                Some(value) => state.default_value(value.clone()),
+                None => state,
+            }
+        });
+
+        let name_sub = cx.subscribe(&name_input, |_this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let value_sub = cx.subscribe(&value_input, |_this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+
+        // Default scope follows the page: project page → project config,
+        // global page → global config ("write where you are").
+        let scope_default_global =
+            !has_project || editing.is_none() && self.state.selection.project_id().is_none();
+        self.env_dialog = Some(EnvDialogState {
+            name_input: name_input.clone(),
+            value_input: value_input.clone(),
+            editing: editing.clone(),
+            scope_global: scope_default_global,
+        });
+
+        let weak = cx.weak_entity();
+        let title_key = if editing.is_some() {
+            "env.edit_title"
+        } else {
+            "env.add_title"
+        };
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .title(t!(title_key).to_string())
+                .child(env::edit_dialog_body(weak.clone(), cx))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(t!("env.edit_ok").to_string())
+                        .ok_variant(ButtonVariant::Primary)
+                        .show_cancel(true)
+                        .cancel_text(t!("nav.cancel").to_string())
+                        .on_ok({
+                            let weak = weak.clone();
+                            move |_, _, cx| {
+                                // Keep the dialog open (return false) while the
+                                // name is invalid — the inline error already shows
+                                // why; on a valid name the dialog closes and the
+                                // write runs (nothing else here writes anything).
+                                if let Some(view) = weak.upgrade() {
+                                    view.update(cx, |this, cx| {
+                                        let Some(dlg) = this.env_dialog.as_ref() else {
+                                            return true;
+                                        };
+                                        let typed_name =
+                                            dlg.name_input.read(cx).value().to_string();
+                                        let typed_value =
+                                            dlg.value_input.read(cx).value().to_string();
+                                        let scope_global = dlg.scope_global;
+                                        if dlg.editing.is_none()
+                                            && !env::valid_env_name(&typed_name)
+                                        {
+                                            cx.notify();
+                                            return false;
+                                        }
+                                        this.env_dialog = None;
+                                        this.run_set_env(
+                                            &typed_name,
+                                            &typed_value,
+                                            scope_global,
+                                            cx,
+                                        );
+                                        true
+                                    })
+                                } else {
+                                    true
+                                }
+                            }
+                        }),
+                )
+        });
+
+        self._env_dialog_subscriptions = vec![name_sub, value_sub];
+        cx.notify();
+    }
+
+    /// Stream `mise set NAME=VALUE` after the dialog confirmed the preview.
+    /// Output goes to the terminal panel; on Exited the env page's data is
+    /// reloaded (the write can add/delete declarations).
+    pub(crate) fn run_set_env(
+        &mut self,
+        name: &str,
+        value: &str,
+        global: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.begin_run("env-set", name);
+        let (session, rx) = match self.state.start_set_env(name, value, global) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.spawn_error_session(format!("{name}={value}"), "set", e, cx);
+                return;
+            }
+        };
+        let done_name = name.to_string();
+        self.stream_to_terminal(
+            session,
+            rx,
+            move |this, cx| {
+                this.state.finish_run("env-set", &done_name);
+                this.load_env_for_selection(cx);
+            },
+            cx,
+        );
+    }
+
+    /// Ask for confirmation, then stream `mise unset NAME`. The dialog names
+    /// the variable AND the source file the declaration lives in (or, when
+    /// the file is unknown, the write scope — rule 10: impact shown first;
+    /// destructive actions are never hidden).
+    pub(crate) fn prompt_env_delete(
+        &mut self,
+        name: String,
+        source: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let global = self.state.selection.project_id().is_none();
+        let body = match &source {
+            Some(file) => t!(
+                "env.delete_confirm_body",
+                name = name.clone(),
+                file = file.clone()
+            )
+            .to_string(),
+            None => t!(
+                "env.delete_confirm_scope",
+                name = name.clone(),
+                scope = if global {
+                    t!("env.scope_global").to_string()
+                } else {
+                    t!("env.scope_project").to_string()
+                }
+            )
+            .to_string(),
+        };
+        let weak = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            // The dialog builder may run again on rebuild; clone per build.
+            let name = name.clone();
+            let body = body.clone();
+            let weak = weak.clone();
+            alert
+                .confirm()
+                .title(t!("env.delete_confirm_title").to_string())
+                .description(body)
+                .ok_text(t!("env.delete").to_string())
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text(t!("nav.cancel").to_string())
+                .on_ok(move |_, _, cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |this, cx| this.run_unset_env(&name, global, cx));
+                    }
+                    true
+                })
+        });
+    }
+
+    /// Internal helper the delete prompt uses to actually run the unset.
+    pub(crate) fn run_unset_env(&mut self, name: &str, global: bool, cx: &mut Context<Self>) {
+        self.state.begin_run("env-unset", name);
+        let (session, rx) = match self.state.start_unset_env(name, global) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.spawn_error_session(name.to_string(), "unset", e, cx);
+                return;
+            }
+        };
+        let done_name = name.to_string();
+        self.stream_to_terminal(
+            session,
+            rx,
+            move |this, cx| {
+                this.state.finish_run("env-unset", &done_name);
+                this.load_env_for_selection(cx);
+            },
+            cx,
+        );
+    }
+
     /// Save the active terminal session's text through an rfd save dialog.
     /// The dialog runs inside the foreground async task (main thread), like
     /// `prompt_add_project`; the file write happens after the pick.
@@ -1003,6 +1484,25 @@ impl RootView {
 
     fn upgrade_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         upgrade::render(cx, &self.state.outdated, self.upgrade_bump)
+    }
+
+    /// Environment page: snapshot the view-local state once and hand it to
+    /// `env::render` (no re-entrant reads mid-layout).
+    fn env_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let filter_text = self.env_filter_input.read(cx).value().to_string();
+        env::render(
+            cx,
+            self.env_tab,
+            self.env_show_all,
+            &self.env_filter_input,
+            &self.state.env_effective,
+            &self.state.env_declarations,
+            &self.state.env_other_declarations,
+            &self.state.env_exact,
+            &self.env_revealed,
+            &self.env_expanded,
+            &filter_text,
+        )
     }
 
     fn tools_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1266,6 +1766,7 @@ impl Render for RootView {
             }
             Selection::Discover => self.discover_pane(cx).into_any_element(),
             Selection::Upgrade => self.upgrade_pane(cx).into_any_element(),
+            Selection::GlobalEnv | Selection::ProjectEnv(_) => self.env_pane(cx).into_any_element(),
             _ => div()
                 .flex_1()
                 .h_full()

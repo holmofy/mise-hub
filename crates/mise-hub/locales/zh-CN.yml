@@ -9,6 +9,7 @@ nav:
   tools: 工具
   tasks: 任务
   env: 环境
+  env_project: 项目环境
   projects: 项目
   add_project: 添加项目
   remove_project: 移除项目
@@ -115,3 +116,52 @@ terminal:
 trust:
   banner: mise 配置未受信任：%{path}
   button: 信任此配置
+env:
+  tab_declarations: 声明
+  tab_effective: 生效
+  tab_diff: 差异
+  loading: 正在加载环境变量…
+  failed: 加载环境变量失败
+  filter: 筛选变量
+  add: 新增变量
+  add_title: 新增变量
+  edit_title: 编辑变量
+  edit: 编辑
+  delete: 删除
+  delete_confirm_title: 删除变量
+  delete_confirm_body: >-
+    删除变量「%{name}」？将通过 mise unset 将其从 %{file} 中移除。
+  delete_confirm_scope: >-
+    删除变量「%{name}」？将通过 mise unset 将其从%{scope}配置中移除。
+  name: 名称
+  value: 值
+  copy: 复制值
+  copy_hidden_warn: 该值处于隐藏状态 — 请先点击显示，再进行复制。
+  show_all: 显示全部
+  hide_all: 隐藏全部
+  redact_note: >-
+    变量值默认隐藏；mise CLI 没有 redact 参数，隐藏 / 显示只是本页的显示行为。
+  ambiguous: 该值可能不准确 — 点击显示查看准确值
+  exact_loading: 正在读取准确值（mise set NAME）…
+  exact_failed: 读取准确值失败
+  also_effective: 已声明 · 已生效
+  chain_other: 另一范围声明
+  chain_effective: 生效值
+  edit_scope: 写入范围
+  scope_global: 全局（mise set --global）
+  scope_project: 本项目
+  preview_cmd: 将执行的命令
+  invalid_name: 名称必须以字母或下划线开头，且只包含字母、数字和下划线。
+  declarations_empty: 此范围内没有声明
+  effective_empty: 没有生效的环境变量
+  no_match: 没有匹配该筛选的变量
+  diff_col_global: 全局
+  diff_col_project: 项目
+  diff_col_effective: 生效
+  diff_select_project: 选择一个项目以对比其配置
+  diff_empty: 没有可对比的内容
+  path_section: PATH 分段
+  path_empty: PATH 没有分段
+  path_tool: 工具 bin 目录（%{tool}）
+  path_config: 配置声明
+  path_system: 系统 / 继承

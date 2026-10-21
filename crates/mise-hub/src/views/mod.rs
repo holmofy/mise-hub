@@ -1,4 +1,5 @@
 pub mod discover;
+pub mod env;
 pub mod setup;
 pub mod sidebar;
 pub mod terminal;

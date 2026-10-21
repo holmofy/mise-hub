@@ -1,5 +1,6 @@
 use crate::app::RootView;
 use crate::state::Selection;
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -208,8 +209,11 @@ fn project_item(
 ) -> impl IntoElement {
     let id = project.id.clone();
     let name = project.name.clone();
-    let selected = matches!(selection, Selection::ProjectTools(sel) if sel == &id);
+    // Any per-project page (tools / env; tasks arrives in M4) keeps the row
+    // highlighted — losing highlight on the env page would read as dead UI.
+    let selected = selection.project_id() == Some(id.as_str());
     let click_id = id.clone();
+    let env_id = id.clone();
 
     div()
         .h_flex()
@@ -240,10 +244,22 @@ fn project_item(
                 ),
         )
         .child(
+            // Per-project 环境 entry: opens that project's env page (the
+            // per-project page switch the sidebar carries for M3).
+            Button::new(format!("project-env-{}", id))
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(AssetIconName::Variable))
+                .tooltip(t!("nav.env_project").to_string())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.select(Selection::ProjectEnv(env_id.clone()), cx);
+                })),
+        )
+        .child(
             Button::new(format!("remove-project-{}", id))
                 .ghost()
                 .xsmall()
-                .icon(IconName::Close)
+                .icon(Icon::new(IconName::Close))
                 .tooltip(t!("nav.remove_project").to_string())
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.prompt_remove_project(id.clone(), name.clone(), window, cx);

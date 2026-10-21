@@ -51,6 +51,17 @@ impl<T> Loadable<T> {
     }
 }
 
+/// Which tab the env page shows (M3-T2): 「声明」 (parsed config declarations
+/// per source file), 「生效」 (the final env mise actually provides), 「差异」
+/// (global vs project vs effective).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnvTab {
+    #[default]
+    Declarations,
+    Effective,
+    Diff,
+}
+
 pub struct AppState {
     pub mise: Option<Arc<Mise>>,
     pub mise_version: Option<String>,
@@ -119,6 +130,31 @@ pub struct AppState {
     /// (`"uninstall:node@20"`, `"use:node@20"`, …), used to disable the
     /// matching action buttons while a run cannot be re-entered safely.
     pub in_flight: HashSet<String>,
+    /// Effective env (`mise env --json-extended`) for the CURRENT scope:
+    /// project root when an env page of a project is selected, global
+    /// otherwise. Loaded asynchronously; `Failed` keeps the raw error (9).
+    pub env_effective: Loadable<Vec<mise_core::EnvVar>>,
+    /// Declared env (`mise set` table) for the CURRENT scope.
+    pub env_declarations: Loadable<Vec<mise_core::EnvDeclaration>>,
+    /// Scope the COMPLETED env snapshot (declarations + effective) belongs
+    /// to, mirroring `outdated_scope`: `Some("global")` / `Some(<root>)`,
+    /// `None` before any listing finished. Diff rows must be built from the
+    /// snapshot of the current scope only.
+    pub env_scope: Option<String>,
+    /// Scope key the IN-FLIGHT env fetch was started for (set when the fetch
+    /// spawns, cleared when its result is applied) — same pattern as
+    /// `outdated_in_flight` so a quick page switch cannot coalesce a
+    /// different scope's refetch with an older scope's request.
+    pub env_in_flight: Option<String>,
+    /// Declarations of the OTHER scope for the diff view: global
+    /// declarations while a project env page is open; idle on global pages
+    /// (there is no "the one project" to compare against — the diff page
+    /// shows the neutral 「选择项目」 state instead).
+    pub env_other_declarations: Loadable<Vec<mise_core::EnvDeclaration>>,
+    /// Exact re-read (`mise set <NAME>`) fills for AMBIGUOUS declaration
+    /// rows, fetched on the user's reveal click. Keyed by variable name and
+    /// cleared on scope change: values of another scope must not bleed.
+    pub env_exact: std::collections::HashMap<String, Loadable<String>>,
 }
 
 impl AppState {
@@ -145,6 +181,12 @@ impl AppState {
             deep_query: None,
             trust_prompt: None,
             in_flight: HashSet::new(),
+            env_effective: Loadable::Idle,
+            env_declarations: Loadable::Idle,
+            env_scope: None,
+            env_in_flight: None,
+            env_other_declarations: Loadable::Idle,
+            env_exact: std::collections::HashMap::new(),
         }
     }
 
@@ -405,6 +447,69 @@ impl AppState {
         let root = self.current_project_root();
         let rx = mise.uninstall_stream(&spec, root.as_deref())?;
         let session = self.terminal.begin(format!("uninstall {spec}"));
+        Ok((session, rx))
+    }
+
+    /// The scope key env listings/actions match against, mirroring
+    /// `outdated_scope_key`: `Some(<project root>)` on a project page,
+    /// `Some("global")` everywhere else.
+    pub fn env_scope_key(&self) -> Option<String> {
+        match self.current_project_root() {
+            Some(root) => Some(root.to_string_lossy().into_owned()),
+            None => Some("global".to_string()),
+        }
+    }
+
+    /// Streamed `mise set NAME=VALUE` after the dialog confirmed (rule 3:
+    /// the ONLY write path for env config — never direct TOML edits). Scope:
+    /// `global=false` requires a project in context (the dialog only offers
+    /// the toggle then) — without one this is a REFUSED error, never a
+    /// silent global write with a project-labeled button. Opens its own
+    /// terminal session; the caller routes events via `push_event_to`.
+    pub fn start_set_env(
+        &mut self,
+        name: &str,
+        value: &str,
+        global: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let root = self.current_project_root();
+        let (global, root) = if global {
+            (true, None)
+        } else {
+            match root {
+                Some(root) => (false, Some(root)),
+                None => return Err(mise_core::CoreError::NotFound),
+            }
+        };
+        let rx = mise.set_env_stream(name, value, global, root.as_deref())?;
+        let session = self.terminal.begin(format!("set {name}={value}"));
+        Ok((session, rx))
+    }
+
+    /// Streamed `mise unset NAME` with the same scope resolution as
+    /// `start_set_env` (the confirm dialog shows the affected file; the write
+    /// is mise's own command, never a TOML edit — rule 3).
+    pub fn start_unset_env(
+        &mut self,
+        name: &str,
+        global: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let root = if global {
+            None
+        } else {
+            Some(
+                self.current_project_root()
+                    .ok_or(mise_core::CoreError::NotFound)?,
+            )
+        };
+        let rx = mise.unset_env_stream(name, global, root.as_deref())?;
+        let session = self.terminal.begin(format!("unset {name}"));
         Ok((session, rx))
     }
 
@@ -2116,5 +2221,150 @@ mod trust_tests {
         assert!(!AppState::deep_search_query_runs(""));
         assert!(!AppState::deep_search_query_runs("   "));
         assert!(AppState::deep_search_query_runs("node"));
+    }
+}
+
+#[cfg(test)]
+mod env_write_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner;
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Records the exact argv of every streamed `mise` invocation so the env
+    /// write contract (`mise set NAME=VALUE` / `mise unset NAME`) is pinned.
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn recording_mise() -> (Mise, Arc<Mutex<Vec<Vec<String>>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mise::new(
+                "mise".into(),
+                Arc::new(RecordingRunner),
+                Arc::new(RecordingStreamer { seen: seen.clone() }),
+            ),
+            seen,
+        )
+    }
+
+    /// Project-scope `mise set` writes through `-C <root>` and keeps the
+    /// `NAME=VALUE` pair as ONE argv element (values with spaces stay intact,
+    /// AGENTS.md rule 2 + mise-core contract).
+    #[test]
+    fn start_set_env_project_scope_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root: String = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectEnv(root.clone());
+
+        let (session, _rx) = state.start_set_env("B", "x y z", false).unwrap();
+
+        assert_eq!(session, 0);
+        assert!(state.terminal.visible);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root.clone(),
+                "set".into(),
+                "B=x y z".into()
+            ]
+        );
+        // The session title carries the command the user can read later.
+        assert_eq!(state.terminal.sessions[0].title, "set B=x y z");
+    }
+
+    /// Global scope: no `-C` ANYWHERE and `--global` AFTER the subcommand
+    /// (mise-core contract for `set`).
+    #[test]
+    fn start_set_env_global_scope_argv() {
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalEnv;
+
+        state.start_set_env("NODE_ENV", "production", true).unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "set".to_string(),
+                "--global".into(),
+                "NODE_ENV=production".into()
+            ]
+        );
+    }
+
+    /// The dialog only shows the project-scope toggle when a project is in
+    /// context — `start_set_env` must refuse `global=false` without one
+    /// rather than silently writing globally (mislabeled scopes are dishonest).
+    #[test]
+    fn start_set_env_project_scope_without_root_is_refused() {
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalEnv;
+
+        assert!(state.start_set_env("FOO", "1", false).is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Project-scope `mise unset`: `-C <root>` before `unset`.
+    #[test]
+    fn start_unset_env_project_scope_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root: String = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectEnv(root.clone());
+
+        state.start_unset_env("B", false).unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["-C".to_string(), root.clone(), "unset".into(), "B".into()]
+        );
+        assert_eq!(state.terminal.sessions[0].title, "unset B");
+    }
+
+    /// Global `mise unset --global NAME`: `--global` AFTER the subcommand.
+    #[test]
+    fn start_unset_env_global_scope_argv() {
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalEnv;
+
+        state.start_unset_env("NODE_ENV", true).unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["unset".to_string(), "--global".into(), "NODE_ENV".into()]
+        );
     }
 }

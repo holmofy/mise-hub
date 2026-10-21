@@ -9,6 +9,7 @@ nav:
   tools: Tools
   tasks: Tasks
   env: Environment
+  env_project: Project environment
   projects: Projects
   add_project: Add project
   remove_project: Remove project
@@ -117,3 +118,56 @@ terminal:
 trust:
   banner: mise config at %{path} is not trusted
   button: Trust this config
+env:
+  tab_declarations: Declarations
+  tab_effective: Effective
+  tab_diff: Diff
+  loading: Loading environment…
+  failed: Failed to load environment
+  filter: Filter variables
+  add: Add variable
+  add_title: Add variable
+  edit_title: Edit variable
+  edit: Edit
+  delete: Delete
+  delete_confirm_title: Delete variable
+  delete_confirm_body: >-
+    Remove variable "%{name}"? It will be removed from %{file} via "mise unset".
+  delete_confirm_scope: >-
+    Remove variable "%{name}"? It will be removed from the %{scope}
+    configuration via "mise unset".
+  name: Name
+  value: Value
+  copy: Copy value
+  copy_hidden_warn: The value is hidden — reveal it first before copying.
+  show_all: Show all values
+  hide_all: Hide all values
+  redact_note: >-
+    Values are hidden by default; the mise CLI has no redact flag, so
+    hiding/showing is a display behavior of this page only.
+  ambiguous: value may be inaccurate — show it for the exact read
+  exact_loading: Reading exact value (mise set NAME)…
+  exact_failed: Exact read failed
+  also_effective: declared · active
+  chain_other: other scope declaration
+  chain_effective: effective value
+  edit_scope: Write scope
+  scope_global: Global (mise set --global)
+  scope_project: This project
+  preview_cmd: Command to run
+  invalid_name: >-
+    The name must start with a letter or underscore and contain only letters,
+    digits and underscores.
+  declarations_empty: No declarations in this scope
+  effective_empty: No effective variables
+  no_match: No variable matches this filter
+  diff_col_global: Global
+  diff_col_project: Project
+  diff_col_effective: Effective
+  diff_select_project: Select a project to compare its config
+  diff_empty: Nothing to compare
+  path_section: PATH segments
+  path_empty: PATH has no segments
+  path_tool: Tool bin dir (%{tool})
+  path_config: Declared in config
+  path_system: System / inherited
