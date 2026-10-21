@@ -1,5 +1,6 @@
 use crate::app::RootView;
 use crate::state::Selection;
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -15,6 +16,7 @@ pub fn render(
     projects: &[Project],
     selection: &Selection,
     collapsed: bool,
+    outdated_count: usize,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
 
@@ -34,6 +36,7 @@ pub fn render(
         Selection::Discover,
         selection,
         &theme,
+        0,
     ));
     col = col.child(nav_item(
         cx,
@@ -41,6 +44,15 @@ pub fn render(
         Selection::GlobalTools,
         selection,
         &theme,
+        0,
+    ));
+    col = col.child(nav_item(
+        cx,
+        t!("nav.upgrade").to_string(),
+        Selection::Upgrade,
+        selection,
+        &theme,
+        outdated_count,
     ));
     col = col.child(nav_item(
         cx,
@@ -48,6 +60,7 @@ pub fn render(
         Selection::GlobalTasks,
         selection,
         &theme,
+        0,
     ));
     col = col.child(nav_item(
         cx,
@@ -55,6 +68,7 @@ pub fn render(
         Selection::GlobalEnv,
         selection,
         &theme,
+        0,
     ));
 
     col = col.child(project_header(cx, collapsed, &theme));
@@ -84,6 +98,7 @@ fn nav_item(
     selection: Selection,
     current: &Selection,
     theme: &Theme,
+    count: usize,
 ) -> impl IntoElement {
     let selected = current == &selection;
     // Click handling lives on `StatefulInteractiveElement`, so the div needs an
@@ -100,13 +115,36 @@ fn nav_item(
         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
             this.select(selection.clone(), cx);
         }))
-        .child(label)
+        .child(
+            // Count badge (upgrade page): a number pill on the right, hidden
+            // entirely when the count is zero so an empty badge never lies.
+            div()
+                .h_flex()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .child(label)
+                .when(count > 0, |d| {
+                    d.child(
+                        div()
+                            .min_w_4()
+                            .px_1p5()
+                            .rounded_full()
+                            .text_xs()
+                            .text_center()
+                            .text_color(theme.background)
+                            .bg(theme.info)
+                            .child(count.to_string()),
+                    )
+                }),
+        )
 }
 
 /// A stable, unique string for one `Selection`, used to build element ids.
 fn selection_id(selection: &Selection) -> String {
     match selection {
         Selection::Discover => "discover".into(),
+        Selection::Upgrade => "upgrade".into(),
         Selection::GlobalTools => "global-tools".into(),
         Selection::GlobalTasks => "global-tasks".into(),
         Selection::GlobalEnv => "global-env".into(),
@@ -171,8 +209,12 @@ fn project_item(
 ) -> impl IntoElement {
     let id = project.id.clone();
     let name = project.name.clone();
-    let selected = matches!(selection, Selection::ProjectTools(sel) if sel == &id);
+    // Any per-project page (tools / tasks / env) keeps the row highlighted
+    // — losing highlight on a subpage would read as dead UI.
+    let selected = selection.project_id() == Some(id.as_str());
     let click_id = id.clone();
+    let env_id = id.clone();
+    let tasks_id = id.clone();
 
     div()
         .h_flex()
@@ -203,10 +245,33 @@ fn project_item(
                 ),
         )
         .child(
+            // Per-project 任务 entry (M4): opens that project's tasks page.
+            Button::new(format!("project-tasks-{}", id))
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(AssetIconName::ListTodo))
+                .tooltip(t!("nav.tasks_project").to_string())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.select(Selection::ProjectTasks(tasks_id.clone()), cx);
+                })),
+        )
+        .child(
+            // Per-project 环境 entry: opens that project's env page (the
+            // per-project page switch the sidebar carries for M3).
+            Button::new(format!("project-env-{}", id))
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(AssetIconName::Variable))
+                .tooltip(t!("nav.env_project").to_string())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.select(Selection::ProjectEnv(env_id.clone()), cx);
+                })),
+        )
+        .child(
             Button::new(format!("remove-project-{}", id))
                 .ghost()
                 .xsmall()
-                .icon(IconName::Close)
+                .icon(Icon::new(IconName::Close))
                 .tooltip(t!("nav.remove_project").to_string())
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.prompt_remove_project(id.clone(), name.clone(), window, cx);

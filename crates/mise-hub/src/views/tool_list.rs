@@ -216,6 +216,9 @@ fn row_element(
     let key = row_key(row);
     let selected = selected_key == Some(key.as_str());
     let theme = cx.theme();
+    // Owned copies for the event closure: the published element must not
+    // borrow the short-lived `row` reference.
+    let load_name = row.name.clone();
 
     div()
         .id(key.clone())
@@ -226,6 +229,9 @@ fn row_element(
         .when(selected, |d| d.bg(theme.muted))
         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
             this.state.selected_tool = Some(key.clone());
+            // The detail pane enriches itself with `mise tool <name> --json`
+            // asynchronously (coalesced + stale-guarded in `load_tool_info`).
+            this.load_tool_info(load_name.clone(), cx);
             cx.notify();
         }))
         .child(

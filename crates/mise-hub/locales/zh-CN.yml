@@ -5,9 +5,12 @@ common:
 nav:
   workbench: 工作台
   discover: 发现
+  upgrade: 升级
   tools: 工具
   tasks: 任务
   env: 环境
+  env_project: 项目环境
+  tasks_project: 项目任务
   projects: 项目
   add_project: 添加项目
   remove_project: 移除项目
@@ -29,33 +32,74 @@ tools:
   scope: 范围
   source: 来源
   install_path: 安装路径
+  status: 状态
   active: 生效
   inactive: 未生效
   overridden: 已覆盖
   apply: 应用版本
-  apply_m2_note: 本里程碑暂未实现，M2 将提供版本应用
+  apply_ok: 应用
+  apply_confirm_title: 应用版本
+  apply_note_project: 这将把该版本写入当前项目的配置。
+  apply_note_global: 这将把该版本写入 mise 的全局配置（由 mise 管理的全局配置文件，而非项目配置）。
+  apply_pin_choice: 固定方式
+  apply_pin: 固定版本（--pin）
+  apply_range: 保留版本范围（默认）
+  apply_will_install: 将安装
+  apply_will_install_none: 无需安装 — 仅写配置
+  apply_config_updates: 将变更的配置文件
+  apply_config_updates_none: 不变更任何配置文件
+  apply_raw: mise use --dry-run 原始输出
+  apply_preview_loading: 正在执行 mise use --dry-run…
+  apply_preview_failed: 预览失败
+  apply_preview_pending_note: 尚未生成确认的执行计划 — 此时确认不会写入任何配置。
+  apply_running: 执行中…
+  apply_unavailable: mise 不可用
+  uninstall: 卸载
+  uninstall_confirm_title: 卸载版本
+  uninstall_confirm_body: >-
+    卸载 %{spec}？仅从本机移除该版本 — 配置文件不受影响；配置里仍声明的已卸载版本会在下次 mise 运行时重新安装。
+  description: 描述
+  url: 主页
+  backend: 后端
+  installed_versions: 已安装版本
+  config_source: 配置来源
+  info_loading: 正在获取工具详情…
+  info_failed: 获取工具详情失败
+  info_unavailable: mise 不可用
   empty: 暂无已安装的工具
   no_match: 没有匹配此搜索的工具
   loading: 加载中…
   failed: 加载工具失败
   select_tool: 选择一个工具
+upgrade:
+  count: "%{n} 个可升级"
+  all: 全部升级
+  row: 升级
+  bump: 包含超出配置范围的版本（--bump）
+  source: 来源
+  loading: 正在检查可升级项…
+  empty: 没有需要升级的工具
+  failed: 加载可升级列表失败
 discover:
   search: 搜索工具（英文关键词）
-  search_note: 本地搜索仅匹配英文关键词；「深度搜索」需联网执行 mise search --all，本里程碑未实现。
+  search_note: 本地搜索仅匹配英文关键词；「深度搜索」联网执行 mise search --all，仅在您显式点击按钮时运行。
   deep_search: 深度搜索
-  deep_search_note: mise search --all 需联网，M2 提供——本里程碑未实现
+  online_results: 联网搜索结果（mise search --all）
+  deep_loading: 正在联网搜索…
+  deep_empty: 联网搜索没有结果
+  deep_failed: 深度搜索失败
   no_results: 没有匹配此查询的工具
   registry_empty: 工具索引为空
   loading: 正在加载工具索引…
   failed: 加载工具索引失败
   installed: 已安装
   install: 安装
+  install_latest: 安装 latest
   pick_tool: 选择一个工具查看可用版本
   installed_not_active: 已安装 · 未生效
   installed_at_version: 已安装版本
   apply_project: 应用到本项目
   apply_global: 应用到全局
-  apply_m2_note: 本里程碑暂未实现，M2 将提供 mise use
   loading_versions: 正在加载版本…
   versions_failed: 加载版本失败
   versions_unavailable: mise 不可用
@@ -70,3 +114,95 @@ terminal:
   failed: 失败
   expand: 展开终端
   collapse: 收起
+trust:
+  banner: mise 配置未受信任：%{path}
+  button: 信任此配置
+tasks:
+  filter: 筛选任务
+  show_hidden: 显示隐藏任务
+  hide_hidden: 不显示隐藏任务
+  loading: 正在加载任务…
+  failed: 加载任务失败
+  empty: 当前范围没有任务
+  no_match: 没有符合筛选条件的任务
+  select_task: 选择一个任务
+  hidden_marker: 隐藏
+  deps_count: "%{n} 个依赖"
+  dependents_count: 被 %{n} 个任务依赖
+  run: 运行
+  run_running: 运行中…
+  run_commands: 运行命令（task.run）
+  watch: 监听
+  watching: 监听中
+  watching_state: 正在监听变更
+  watch_stop_note: >-
+    mise-hub 无法停止运行中的监听——CLI 流没有停止 / 终止句柄。监听会随
+    进程退出而结束（例如 mise 在配置变更后自行退出），退出应用也会结束它。
+  dependencies: 依赖
+  depends: 任务之前运行（depends）
+  depends_post: 任务之后运行，失败也执行（depends_post）
+  wait_for: 仅延迟启动——mise 不会运行它（wait_for）
+  chain: 执行顺序
+  chain_empty: 无依赖——任务单独运行
+  chain_cycle: 处于依赖环中
+  chain_missing: 本范围内未定义
+  cycle_warn: '「%{task}」的依赖链中存在依赖环'
+  cycle_hint: >-
+    其中一项依赖通过 depends / depends_post 卷入了依赖环，mise 无法完成这条
+    链。请先检查下方的依赖列表，再决定是否运行。
+env:
+  tab_declarations: 声明
+  tab_effective: 生效
+  tab_diff: 差异
+  loading: 正在加载环境变量…
+  failed: 加载环境变量失败
+  filter: 筛选变量
+  add: 新增变量
+  add_title: 新增变量
+  edit_title: 编辑变量
+  edit_ok: 确定
+  edit: 编辑
+  delete: 删除
+  delete_confirm_title: 删除变量
+  delete_confirm_body: >-
+    删除变量「%{name}」？将通过 mise unset 将其从 %{file} 中移除。
+  delete_confirm_scope: >-
+    删除变量「%{name}」？将通过 mise unset 将其从%{scope}配置中移除。
+  name: 名称
+  value: 值
+  copy: 复制值
+  copy_hidden_warn: 该值处于隐藏状态 — 请先点击显示，再进行复制。
+  show_all: 显示全部
+  hide_all: 隐藏全部
+  redact_note: >-
+    mise 默认会对 redact = true 的声明打码；本应用通过 "mise set --no-redact"
+    读取原始值，但在此页保持遮蔽显示。显示 / 隐藏只是本页的显示行为。
+  ambiguous: 该值可能不准确 — 点击显示查看准确值
+  exact_loading: 正在读取准确值（mise set NAME）…
+  exact_failed: 读取准确值失败
+  copy_redacted_warn: 该值被 mise 打码，只有精确重读后才能得到真实值。
+  edit_refuse_ambiguous: >-
+    尚未读到该值的精确内容，编辑被拒绝，以免把误读的值写回配置。等精确读取完成后再点击编辑。
+  also_effective: 已声明 · 已生效
+  chain_other: 另一范围声明
+  chain_effective: 生效值
+  edit_scope: 写入范围
+  scope_global: 全局（mise set --global）
+  scope_project: 本项目
+  preview_cmd: 将执行的命令
+  invalid_name: 名称必须以字母或下划线开头，且只包含字母、数字和下划线。
+  declarations_empty: 此范围内没有声明
+  effective_empty: 没有生效的环境变量
+  no_match: 没有匹配该筛选的变量
+  diff_col_global: 全局
+  diff_col_project: 项目
+  diff_col_effective: 生效
+  diff_select_project: 选择一个项目以对比其配置
+  diff_empty: 没有可对比的内容
+  path_section: PATH 分段
+  path_empty: PATH 没有分段
+  path_tool: 工具 bin 目录（%{tool}）
+  path_config: 配置声明
+  path_system: 系统 / 继承
+  tool_injected: 由工具注入（%{tool}）
+  system: 系统 / 进程环境

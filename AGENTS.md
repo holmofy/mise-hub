@@ -187,8 +187,8 @@ cargo fmt --all && cargo clippy --workspace --all-targets
 
 ## Current Status（2026-10-19）
 
-- 分支 `feat/m0-m1`；M0 + M1 完成，等待合并与 GUI 人工验收。
-- 已完成：workspace 骨架、runner/locator、registry + 本地搜索、已安装工具解析与范围归类、项目持久化、流式安装事件、Mise 门面、UI 骨架与侧边栏、主题与双语、mise 检测与引导页、工具页、发现页、版本选择/安装/底部终端面板、空状态与验收记录。
-- 自动化检查全绿：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`（59 passed）、`cargo build --workspace`。
-- 待人工验收：`cargo run -p mise-hub` 的 GUI 行为，逐项见 `docs/superpowers/plans/2026-10-19-mise-hub-m0-m1-verification.md`。
-- 后续里程碑：M2 工具管理、M3 环境变量、M4 任务、M5 收尾。
+- 分支 `feat/m2-m4`；M2、M3、M4 完成，等待合并与 GUI 人工验收。
+- 已完成：M0/M1（骨架、发现、安装、终端）+ M2（升级、卸载、应用版本、深度搜索、信任引导）+ M3（环境变量双视图/追溯/PATH/增删改/差异）+ M4（任务发现、依赖树、运行/监听）。
+- 自动化检查全绿：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`（243 passed）、`cargo build --workspace`。
+- 待人工验收：`cargo run -p mise-hub` 的 GUI 行为，逐项见 `docs/superpowers/plans/*-verification.md`。
+- 后续里程碑：M5 收尾（打包分发、自动更新、配置/诊断页、i18n 补全）。

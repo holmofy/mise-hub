@@ -1,11 +1,17 @@
-use mise_core::{CoreError, Mise, ProjectStore, ScopeFilter, ToolEntry, ToolRow, filter_rows};
-use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent};
+use mise_core::manage::UsePreview;
+use mise_core::{
+    CoreError, DeepSearchHit, Mise, OutdatedTool, ProjectStore, ScopeFilter, ToolEntry, ToolRow,
+    filter_rows,
+};
+use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent, types::ToolInfo};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     Discover,
+    Upgrade,
     GlobalTools,
     GlobalTasks,
     GlobalEnv,
@@ -45,6 +51,17 @@ impl<T> Loadable<T> {
     }
 }
 
+/// Which tab the env page shows (M3-T2): 「声明」 (parsed config declarations
+/// per source file), 「生效」 (the final env mise actually provides), 「差异」
+/// (global vs project vs effective).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnvTab {
+    #[default]
+    Declarations,
+    Effective,
+    Diff,
+}
+
 pub struct AppState {
     pub mise: Option<Arc<Mise>>,
     pub mise_version: Option<String>,
@@ -71,6 +88,101 @@ pub struct AppState {
     pub versions_tool: Option<String>,
     /// Bottom terminal panel sessions.
     pub terminal: TerminalState,
+    /// Rows of `mise outdated` for the upgrade page, loaded with the current
+    /// project root when a project page is selected (global scope otherwise).
+    pub outdated: Loadable<Vec<OutdatedTool>>,
+    /// The scope the `outdated` snapshot was taken in: `Some("global")` after
+    /// a global listing, `Some(<project root>)` after a project-scope listing,
+    /// `None` before any listing finished. Per-tool upgrade visibility must
+    /// match this against the CURRENT scope, or a stale snapshot from one
+    /// page would gate actions that run in another (scope consistency).
+    pub outdated_scope: Option<String>,
+    /// The scope key the IN-FLIGHT `outdated` fetch was started for (set when
+    /// the fetch spawns, cleared when its result is applied). Tracked
+    /// separately from `outdated_scope` so "a fetch for scope X is running"
+    /// can never be confused with "the completed snapshot belongs to X" —
+    /// a quick B → A → B page switch must not coalesce B's refetch with A's
+    /// in-flight request (fix round 2 of the M2-T3 regression).
+    pub outdated_in_flight: Option<String>,
+    /// Tool detail from `mise tool <name> --json` for the selected tools-page
+    /// row, loaded asynchronously (see `RootView::load_tool_info`); a failure
+    /// keeps the raw error for the detail pane (rule 9) while basic fields
+    /// from `mise ls` still render.
+    pub tool_info: Loadable<ToolInfo>,
+    /// Which tool `tool_info` belongs to; stale results are dropped.
+    pub tool_info_tool: Option<String>,
+    /// Online wide-search results (`mise search --all`), filled ONLY on the
+    /// user's explicit 「深度搜索」 click — never per keystroke. Kept in a
+    /// separate section; it never replaces the local search list.
+    pub deep_hits: Loadable<Vec<DeepSearchHit>>,
+    /// The query the `deep_hits` snapshot belongs to (None = no deep search
+    /// run yet). Guards stale results against a newer query, and enables
+    /// retry with the last query.
+    pub deep_query: Option<String>,
+    /// Set when an operation fails with an untrusted-config signature (see
+    /// `is_untrusted_error`): the path `mise trust` should be pointed at —
+    /// the project root for project-scope operations, the config file's
+    /// directory for global ones. The root banner offers the explicit
+    /// 「信任此配置」 action; it is NEVER set automatically (no auto-trust)
+    /// and the underlying error stays visible wherever it landed (rule 9).
+    pub trust_prompt: Option<PathBuf>,
+    /// Specs of destructive/long runs currently in flight
+    /// (`"uninstall:node@20"`, `"use:node@20"`, …), used to disable the
+    /// matching action buttons while a run cannot be re-entered safely.
+    pub in_flight: HashSet<String>,
+    /// Effective env (`mise env --json-extended`) for the CURRENT scope:
+    /// project root when an env page of a project is selected, global
+    /// otherwise. Loaded asynchronously; `Failed` keeps the raw error (9).
+    pub env_effective: Loadable<Vec<mise_core::EnvVar>>,
+    /// Declared env (`mise set` table) for the CURRENT scope.
+    pub env_declarations: Loadable<Vec<mise_core::EnvDeclaration>>,
+    /// Scope the COMPLETED env snapshot (declarations + effective) belongs
+    /// to, mirroring `outdated_scope`: `Some("global")` / `Some(<root>)`,
+    /// `None` before any listing finished. Diff rows must be built from the
+    /// snapshot of the current scope only.
+    pub env_scope: Option<String>,
+    /// Scope key the IN-FLIGHT env fetch was started for (set when the fetch
+    /// spawns, cleared when its result is applied) — same pattern as
+    /// `outdated_in_flight` so a quick page switch cannot coalesce a
+    /// different scope's refetch with an older scope's request.
+    pub env_in_flight: Option<String>,
+    /// Declarations of the OTHER scope for the diff view: global
+    /// declarations while a project env page is open; idle on global pages
+    /// (there is no "the one project" to compare against — the diff page
+    /// shows the neutral 「选择项目」 state instead).
+    pub env_other_declarations: Loadable<Vec<mise_core::EnvDeclaration>>,
+    /// Exact re-read (`mise set <NAME>`) fills for AMBIGUOUS declaration
+    /// rows, fetched on the user's reveal click. Keyed by variable name and
+    /// cleared on scope change: values of another scope must not bleed.
+    pub env_exact: std::collections::HashMap<String, Loadable<String>>,
+    /// Rows of `mise tasks ls --json` for the CURRENT scope: project root on
+    /// a project tasks page, global otherwise. Loaded asynchronously; a
+    /// failure keeps the raw error (rule 9).
+    pub tasks: Loadable<Vec<mise_core::Task>>,
+    /// The scope key the COMPLETED `tasks` snapshot belongs to, mirroring
+    /// `outdated_scope`; render-side actions must match the CURRENT scope.
+    pub tasks_scope: Option<String>,
+    /// Scope key the IN-FLIGHT `tasks` fetch was started for (same pattern as
+    /// `outdated_in_flight` / `env_in_flight`).
+    pub tasks_in_flight: Option<String>,
+    /// The task selected in the tasks-page detail pane (name, verbatim —
+    /// file tasks like `build:index` are never rewritten).
+    pub selected_task: Option<String>,
+    /// 「显示隐藏任务」 toggle: hidden tasks are filtered OUT by default.
+    pub tasks_show_hidden: bool,
+    /// Session index of the still-running `mise watch` per task name, so
+    /// the detail pane can show a persistent 监听中 state; entries leave
+    /// when the watch exits.
+    pub task_watch_sessions: std::collections::HashMap<String, usize>,
+    /// Backup of the config file most recently copied before a write
+    /// (`use` / `set` / `unset`). Diagnostics only; the backup itself already
+    /// happened when this is `Some`, so no UI depends on it.
+    pub last_backup: Option<PathBuf>,
+    /// Where `backup_before_write` copies config files. Production uses
+    /// [`mise_core::default_backup_dir`]; the two GLOBAL-scope write tests
+    /// must point this at a tempdir so the developer's real
+    /// `~/.config/mise/config.toml` is never read or copied there.
+    pub backup_dir: PathBuf,
 }
 
 impl AppState {
@@ -88,6 +200,57 @@ impl AppState {
             versions: Loadable::Idle,
             versions_tool: None,
             terminal: TerminalState::default(),
+            outdated: Loadable::Idle,
+            outdated_scope: None,
+            outdated_in_flight: None,
+            tool_info: Loadable::Idle,
+            tool_info_tool: None,
+            deep_hits: Loadable::Idle,
+            deep_query: None,
+            trust_prompt: None,
+            in_flight: HashSet::new(),
+            env_effective: Loadable::Idle,
+            env_declarations: Loadable::Idle,
+            env_scope: None,
+            env_in_flight: None,
+            env_other_declarations: Loadable::Idle,
+            env_exact: std::collections::HashMap::new(),
+            tasks: Loadable::Idle,
+            tasks_scope: None,
+            tasks_in_flight: None,
+            selected_task: None,
+            tasks_show_hidden: false,
+            task_watch_sessions: std::collections::HashMap::new(),
+            last_backup: None,
+            backup_dir: mise_core::default_backup_dir(),
+        }
+    }
+
+    /// Copy the config file a scope-based write is about to touch into the
+    /// app's backup directory (spec §5.4: 写配置前先备份). Fail-closed: an
+    /// IO error aborts the write BEFORE any mise command is started.
+    pub fn backup_before_write(&mut self, path: &Path) -> Result<(), mise_core::CoreError> {
+        // Reset first: when the target file does not exist yet there is nothing
+        // to back up, and a stale path from a previous write must never be
+        // echoed as if it belonged to this one.
+        self.last_backup = None;
+        if let Some(backup) = mise_core::backup_file(path, &self.backup_dir)? {
+            self.last_backup = Some(backup);
+        }
+        Ok(())
+    }
+
+    /// The config file a scope-based write (`use` / `set` / `unset` by
+    /// scope) touches: the project root's `mise.toml` for project scope,
+    /// the global `~/.config/mise/config.toml` for global scope. `None` when
+    /// the root is missing (project scope is refused before this matters) or
+    /// the home directory cannot be resolved.
+    pub fn scope_config_path(&self, global: bool) -> Option<PathBuf> {
+        if global {
+            mise_core::global_config_path()
+        } else {
+            self.current_project_root()
+                .map(|root| root.join("mise.toml"))
         }
     }
 
@@ -155,17 +318,121 @@ impl AppState {
             return Ok(());
         };
         let root = self.current_project_root();
-        let set = mise.installed(root.as_deref())?;
+        let set = match mise.installed(root.as_deref()) {
+            Ok(set) => set,
+            Err(e) => {
+                self.note_untrusted(&e);
+                return Err(e);
+            }
+        };
         self.installed = Loadable::Ready(set.rows(root.as_deref()));
         Ok(())
     }
 
-    /// Start `mise install tool@version` (install ONLY — never `mise use`,
-    /// AGENTS.md rule 4) targeting the current project (`-C` is included when
-    /// a project is selected; discover-page installs activate nothing, per
-    /// rule 4), open a new terminal session for it, and hand the caller that
-    /// session's index plus the event receiver; the VIEW routes the stream
-    /// into exactly that session (never "the active one", see rule 2).
+    /// Number of outdated tools for the sidebar badge; zero while unknown so
+    /// the badge stays hidden until the upgrade page actually loaded data.
+    pub fn outdated_count(&self) -> usize {
+        self.outdated.ready().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// The scope key `outdated` / `outdated_from_current_scope` are matched
+    /// against: `Some(<project root>)` on a project page, `Some("global")`
+    /// everywhere else (Selection::Upgrade carries no project id, so the
+    /// upgrade listing and the upgrade run are both global — rule 2).
+    pub fn outdated_scope_key(&self) -> Option<String> {
+        match self.current_project_root() {
+            Some(root) => Some(root.to_string_lossy().into_owned()),
+            None => Some("global".to_string()),
+        }
+    }
+
+    /// Pure coalesce predicate for the async `outdated` fetch. A new fetch
+    /// must start EXCEPT when one is already in flight for this exact scope
+    /// (`in_flight`, tracked separately from the completed snapshot's scope)
+    /// or when a `Ready` snapshot for the same scope can be reused. This
+    /// decision-point pure helper exists so the B → A → B regression
+    /// (fix round 2) is testable without GPUI: with A's fetch in flight and
+    /// B completed, the caller must refetch B instead of coalescing with
+    /// A's request.
+    pub fn should_load_outdated(
+        in_flight: Option<&str>,
+        completed_scope: Option<&str>,
+        completed_is_ready: bool,
+        expected: &str,
+    ) -> bool {
+        if in_flight == Some(expected) {
+            return false;
+        }
+        completed_scope != Some(expected) || !completed_is_ready
+    }
+
+    /// The `outdated` snapshot ONLY when it was taken in the CURRENT scope:
+    /// per-tool upgrade visibility builds on this, so a stale global
+    /// snapshot can never gate a project-scope upgrade (or vice versa).
+    pub fn outdated_from_current_scope(&self) -> Option<&[OutdatedTool]> {
+        if self.outdated_scope != self.outdated_scope_key() {
+            return None;
+        }
+        self.outdated.ready().map(|v| v.as_slice())
+    }
+
+    /// Load `mise outdated --json` for the upgrade page: with the current
+    /// project root when a project page is selected (project scope), global
+    /// scope otherwise (no `-C`, per AGENTS.md rule 2). The scope of THIS
+    /// listing is always the scope `start_upgrade` upgrades in, closing the
+    /// "list global, upgrade project" hole. Failures land in
+    /// `Loadable::Failed` with the raw message (rule 9).
+    pub fn refresh_outdated(&mut self) -> Result<(), CoreError> {
+        let Some(mise) = &self.mise else {
+            return Ok(());
+        };
+        let root = self.current_project_root();
+        match mise.outdated(root.is_none(), root.as_deref()) {
+            Ok(tools) => {
+                self.outdated = Loadable::Ready(tools);
+                // Tag the snapshot with its scope so per-tool upgrade
+                // visibility can never be driven by another page's stale
+                // listing (rule consistency: list and run share the scope).
+                self.outdated_scope = self.outdated_scope_key();
+                // The synchronous refresh owns the fetch end-to-end; any
+                // coalesced in-flight marker is obsolete once it lands.
+                self.outdated_in_flight = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.note_untrusted(&e);
+                self.outdated = Loadable::Failed(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Start `mise upgrade` and open a new terminal session for it, exactly
+    /// like `start_install`: the caller routes the receiver's events into the
+    /// returned session index via `push_event_to`. Scope follows the current
+    /// selection: a project page upgrades that project (`-C`, no `--global`),
+    /// everything else (Upgrade page, global tools) is global-scope
+    /// (`--global`, no `-C`). `spec == None` upgrades everything.
+    pub fn start_upgrade(
+        &mut self,
+        spec: Option<&str>,
+        bump: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let root = self.current_project_root();
+        let global = root.is_none();
+        let title = match spec {
+            Some(spec) => format!("upgrade {spec}"),
+            None => "upgrade".to_string(),
+        };
+        let rx = mise.upgrade_stream(spec, bump, global, root.as_deref())?;
+        let session = self.terminal.begin(title);
+        Ok((session, rx))
+    }
+
+    /// Install the tool@{version} spec: install ONLY — never `mise use` (rule 4)
     pub fn start_install(
         &mut self,
         tool: &str,
@@ -178,6 +445,354 @@ impl AppState {
         let rx = mise.install_stream(tool, version, root.as_deref())?;
         let session = self.terminal.begin(format!("install {tool}@{version}"));
         Ok((session, rx))
+    }
+
+    /// Scope for a `mise use` action (use_dry_run / use_apply_stream):
+    /// project page → project scope; everything else → global scope. This is
+    /// the scope resolution pinned by the apply tests and mirrors which tool
+    /// listing produced the version ("apply to where you see it").
+    pub fn use_scope(&self, global: bool) -> (bool, Option<PathBuf>) {
+        let root = self.current_project_root();
+        (global || root.is_none(), if global { None } else { root })
+    }
+
+    /// The blocking `mise use --dry-run` call for one scope — it runs ON the
+    /// app's background thread (never the UI thread). The scope comes from
+    /// `use_scope` beforehand; this helper only wraps the core call so the
+    /// preview path has a single named seam (testable with a fake runner).
+    pub fn use_preview(
+        mise: &Mise,
+        spec: &str,
+        global: bool,
+        root: Option<&Path>,
+    ) -> Result<UsePreview, CoreError> {
+        mise.use_dry_run(spec, global, root)
+    }
+
+    /// Stream `mise use [--pin] <spec>` and open its terminal session. The
+    /// caller registers/unregisters the run key via `begin_run`/`finish_run`
+    /// so the apply button cannot be re-entered while it streams.
+    pub fn start_use(
+        &mut self,
+        spec: &str,
+        global: bool,
+        pin: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
+        };
+        let (global, root) = self.use_scope(global);
+        let target = self.scope_config_path(global);
+        self.backup_before_write(&target.ok_or(mise_core::CoreError::NotFound)?)?;
+        let rx = match mise.use_apply_stream(spec, global, pin, root.as_deref()) {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.note_untrusted(&e);
+                return Err(e);
+            }
+        };
+        let scope = if global { " (--global)" } else { "" };
+        let session = self.terminal.begin(format!("use {spec}{scope}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
+        Ok((session, rx))
+    }
+
+    /// Stream `mise uninstall <tool>@<version>` with the current project root
+    /// for `-C` context, and open its terminal session. Only removes the
+    /// installed version — the config entry is NEVER touched (rule 3: writes
+    /// go through mise commands; `uninstall` is machine-side, `use`/`set` is
+    /// config-side and out of this path entirely).
+    pub fn start_uninstall(
+        &mut self,
+        tool: &str,
+        version: &str,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
+        };
+        let spec = uninstall_spec(tool, version);
+        let root = self.current_project_root();
+        let rx = mise.uninstall_stream(&spec, root.as_deref())?;
+        let session = self.terminal.begin(format!("uninstall {spec}"));
+        Ok((session, rx))
+    }
+
+    /// Pure coalesce predicate for the async `env` fetch. Same semantics as
+    /// `should_load_outdated` (same snapshot / in-flight keys) plus `force`:
+    /// a completed write MUST reload even though the scope and the Ready
+    /// snapshot match, because the write just added or deleted declarations.
+    pub fn should_load_env(
+        in_flight: Option<&str>,
+        completed_scope: Option<&str>,
+        completed_is_ready: bool,
+        expected: &str,
+        force: bool,
+    ) -> bool {
+        force
+            || Self::should_load_outdated(in_flight, completed_scope, completed_is_ready, expected)
+    }
+
+    /// The scope key env listings/actions match against, mirroring
+    /// `outdated_scope_key`: `Some(<project root>)` on a project page,
+    /// `Some("global")` everywhere else.
+    pub fn env_scope_key(&self) -> Option<String> {
+        match self.current_project_root() {
+            Some(root) => Some(root.to_string_lossy().into_owned()),
+            None => Some("global".to_string()),
+        }
+    }
+
+    /// Streamed `mise set NAME=VALUE` after the dialog confirmed (rule 3:
+    /// the ONLY write path for env config — never direct TOML edits). Scope:
+    /// `global=false` requires a project in context (the dialog only offers
+    /// the toggle then) — without one this is a REFUSED error, never a
+    /// silent global write with a project-labeled button. Opens its own
+    /// terminal session; the caller routes events via `push_event_to`.
+    pub fn start_set_env(
+        &mut self,
+        name: &str,
+        value: &str,
+        global: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
+        };
+        let root = self.current_project_root();
+        let (global, root) = if global {
+            (true, None)
+        } else {
+            match root {
+                Some(root) => (false, Some(root)),
+                None => return Err(mise_core::CoreError::NotFound),
+            }
+        };
+        self.backup_before_write(
+            &self
+                .scope_config_path(global)
+                .ok_or(mise_core::CoreError::NotFound)?,
+        )?;
+        let rx = mise.set_env_stream(name, value, global, root.as_deref())?;
+        let session = self.terminal.begin(format!("set {name}={value}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
+        Ok((session, rx))
+    }
+
+    /// Streamed `mise unset NAME` with the same scope resolution as
+    /// `start_set_env` (the confirm dialog shows the affected file; the write
+    /// is mise's own command, never a TOML edit — rule 3).
+    pub fn start_unset_env(
+        &mut self,
+        name: &str,
+        global: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
+        };
+        let root = if global {
+            None
+        } else {
+            Some(
+                self.current_project_root()
+                    .ok_or(mise_core::CoreError::NotFound)?,
+            )
+        };
+        self.backup_before_write(
+            &self
+                .scope_config_path(global)
+                .ok_or(mise_core::CoreError::NotFound)?,
+        )?;
+        let rx = mise.unset_env_stream(name, global, root.as_deref())?;
+        let session = self.terminal.begin(format!("unset {name}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
+        Ok((session, rx))
+    }
+
+    /// Streamed `mise [-C dir] set --file <file> NAME=VALUE`: the EDIT path.
+    /// The declaration being edited carries its own `source` file, and every
+    /// `mise set` with `--file` targets that exact file — never whatever
+    /// file the current page's scope would pick. `-C` follows the current
+    /// project context (rule 2).
+    pub fn start_set_env_file(
+        &mut self,
+        name: &str,
+        value: &str,
+        file: &Path,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
+        };
+        let root = self.current_project_root();
+        self.backup_before_write(file)?;
+        let rx = mise.set_env_file_stream(name, value, file, root.as_deref())?;
+        let session = self.terminal.begin(format!("set {name}={value}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
+        Ok((session, rx))
+    }
+
+    /// Streamed `mise [-C dir] unset --file <file> NAME`: the DELETE path for
+    /// a declaration with a known `source` — the exact file the row declares
+    /// in, never the page's scope (a global row on a project page would
+    /// otherwise be a silent no-op: `mise -C proj unset` exits 0, removes
+    /// nothing).
+    pub fn start_unset_env_file(
+        &mut self,
+        name: &str,
+        file: &Path,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let mise = match &self.mise {
+            Some(mise) => mise.clone(),
+            None => return Err(mise_core::CoreError::NotFound),
+        };
+        let root = self.current_project_root();
+        self.backup_before_write(file)?;
+        let rx = mise.unset_env_file_stream(name, file, root.as_deref())?;
+        let session = self.terminal.begin(format!("unset {name}"));
+        if let Some(b) = self.last_backup.clone() {
+            self.terminal.push_event_to(
+                session,
+                StreamEvent::Stdout(format!("backup: {}", b.display())),
+            );
+        }
+        Ok((session, rx))
+    }
+
+    // -------------------------------------------------------------------
+    // Tasks page (M4-T2 / M4-T3)
+    // -------------------------------------------------------------------
+
+    /// The scope key `tasks` snapshots match against, mirroring
+    /// `outdated_scope_key` / `env_scope_key`: `Some(<project root>)` on a
+    /// project tasks page, `Some("global")` everywhere else.
+    pub fn tasks_scope_key(&self) -> Option<String> {
+        match self.current_project_root() {
+            Some(root) => Some(root.to_string_lossy().into_owned()),
+            None => Some("global".to_string()),
+        }
+    }
+
+    /// The loaded task listing ONLY when its scope still is the current one.
+    pub fn tasks_from_current_scope(&self) -> Option<&[mise_core::Task]> {
+        if self.tasks_scope != self.tasks_scope_key() {
+            return None;
+        }
+        self.tasks.ready().map(|v| v.as_slice())
+    }
+
+    /// The dependency graph of the CURRENT scope's task listing (`None`
+    /// while the listing is absent or stale).
+    pub fn current_task_graph(&self) -> Option<mise_core::TaskGraph> {
+        self.tasks_from_current_scope()
+            .map(|tasks| mise_core::build_graph(tasks.to_vec()))
+    }
+
+    /// Streamed `mise [-C dir] run <task>` (verbatim task name; backend
+    /// prefixes and colons are never rewritten) and its terminal session.
+    /// Scope: project tasks page → that project (`-C` first, rule 2),
+    /// global tasks page → global (no `-C`).
+    pub fn start_task_run(
+        &mut self,
+        task: &str,
+        watch: bool,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let root = self.current_project_root();
+        let rx = if watch {
+            mise.watch_task_stream(task, root.as_deref())?
+        } else {
+            mise.run_task_stream(task, root.as_deref())?
+        };
+        let verb = if watch { "watch" } else { "run" };
+        let session = self.terminal.begin(format!("{verb} {task}"));
+        if watch {
+            self.task_watch_sessions.insert(task.to_string(), session);
+        }
+        Ok((session, rx))
+    }
+
+    /// Whether the task's `mise watch` session is still live (used for the
+    /// persistent 监听中 state in the detail pane).
+    pub fn task_watch_running(&self, task: &str) -> bool {
+        self.task_watch_sessions
+            .get(task)
+            .and_then(|ix| self.terminal.sessions.get(*ix))
+            .is_some_and(|s| s.status == RunStatus::Running)
+    }
+
+    /// Drop the watch bookkeeping for a finished watch session (called on
+    /// `Exited`). The removal is guarded by the session index: an OLDER run
+    /// completing late must never erase the bookkeeping of a NEWER watch
+    /// still streaming for the same task (plain-run cleanups never registered
+    /// an entry, so the no-match guard keeps them no-ops too).
+    pub fn finish_task_watch(&mut self, task: &str, session: usize) {
+        if self.task_watch_sessions.get(task) == Some(&session) {
+            self.task_watch_sessions.remove(task);
+        }
+    }
+}
+
+/// The pure re-entry guard behind starting a task action: a `mise watch`
+/// may NOT be started while a watch for the same task is already running
+/// (the UI disables the button, but this guard must hold even if the UI
+/// is bypassed — a second spawn would duplicate the watcher and let the
+/// first watch's cleanup erase the second one's state). Plain runs are
+/// handled separately by the `task-run` in-flight key.
+pub fn should_start_task_run(watch: bool, watch_running: bool) -> bool {
+    !(watch && watch_running)
+}
+
+/// The variable name a dialog write actually targets: while EDITING, the name
+/// is FIXED to the name being edited and the typed text (an intentionally
+/// non-editable name field / a stale buffer) must never leak into
+/// `mise set "=VALUE"` — editing wins; otherwise the trimmed typed name.
+/// Trim is deliberate: a stray space must not be written into config.
+/// Empty result is invalid — the caller must refuse the write.
+pub fn resolved_env_name(editing: Option<&str>, typed: &str) -> String {
+    match editing {
+        Some(name) => name.trim().to_string(),
+        None => typed.trim().to_string(),
+    }
+}
+
+impl AppState {
+    /// Mark a run in flight (`begin_run` before streaming, `finish_run` on
+    /// Exited) so matching action buttons can disable themselves.
+    pub fn begin_run(&mut self, kind: &str, spec: &str) {
+        self.in_flight.insert(run_key(kind, spec));
+    }
+
+    pub fn finish_run(&mut self, kind: &str, spec: &str) {
+        self.in_flight.remove(&run_key(kind, spec));
+    }
+
+    pub fn is_busy(&self, kind: &str, spec: &str) -> bool {
+        self.in_flight.contains(&run_key(kind, spec))
     }
 
     /// The install state of a tool as the UI should present it, per AGENTS.md
@@ -225,10 +840,40 @@ impl AppState {
                 Ok(())
             }
             Err(e) => {
+                self.note_untrusted(&e);
                 self.registry = Loadable::Failed(e.to_string());
                 Err(e)
             }
         }
+    }
+
+    /// Records an untrusted-config failure from ANY mise operation onto the
+    /// persistent trust banner. The banner path is the project root for
+    /// project-scope operations; global operations have no `-C` context, so
+    /// the target is parsed from the error text instead. Non-untrusted
+    /// errors are ignored (the operation's own error surface keeps showing
+    /// them verbatim — rule 9); nothing here calls `mise trust` itself.
+    pub fn note_untrusted(&mut self, err: &CoreError) {
+        let message = err.to_string();
+        if !is_untrusted_error(&message) {
+            return;
+        }
+        // A failure whose path cannot be parsed (loose matcher, wording
+        // shift) must not clear an already-shown prompt — the banner only
+        // goes away after a successful trust, never on a parse miss.
+        if let Some(target) = match self.current_project_root() {
+            Some(root) => Some(root),
+            None => untrusted_target(&message),
+        } {
+            self.trust_prompt = Some(target);
+        }
+    }
+
+    /// Pure gate for the deep-search entry: a blank (or whitespace-only)
+    /// query must NOT reach the core at all — the online 「深度搜索」 (which
+    /// runs `mise search --all`) only runs for a non-empty query.
+    pub fn deep_search_query_runs(query: &str) -> bool {
+        !query.trim().is_empty()
     }
 
     /// Search or browse the loaded registry. An empty query returns every
@@ -245,6 +890,71 @@ impl AppState {
             Loadable::Ready(entries) => SearchIndex::new(entries.clone()).search(query, limit),
             _ => vec![],
         }
+    }
+}
+
+/// Detects mise's untrusted-config signature in an operation's error text.
+/// Real signature (mise 2026.10.x): `Config files in <path> are not trusted.`
+/// `Trust them with \`mise trust\`.` Both markers are required: an
+/// unrelated failure (network, bad JSON, command help mentioning trust)
+/// never produces a false-positive trust prompt.
+pub fn is_untrusted_error(message: &str) -> bool {
+    message.contains("are not trusted")
+        && (message.contains("Trust them with") || message.contains("`mise trust`"))
+}
+
+/// Extracts the directory to trust from the untrusted error message. mise
+/// prints `Config files in <path> are not trusted.` where `<path>` is a
+/// config FILE (global scope: `~/.config/mise/config.toml`); the prompt
+/// points at its parent so `mise trust <dir>` covers the whole directory.
+fn untrusted_target(message: &str) -> Option<PathBuf> {
+    const HEAD: &str = "Config files in ";
+    let start = message.find(HEAD)? + HEAD.len();
+    let rest = &message[start..];
+    let end = rest.find(" are not trusted")?;
+    let path = PathBuf::from(rest[..end].trim());
+    if path.to_string_lossy().ends_with(".toml") {
+        path.parent().map(Path::to_path_buf).or(Some(path))
+    } else {
+        Some(path)
+    }
+}
+
+/// The spec `mise uninstall` receives: `{tool}@{version}`, passed verbatim
+/// (backend prefixes like `npm:prettier` are never split or rewritten).
+pub fn uninstall_spec(tool: &str, version: &str) -> String {
+    format!("{tool}@{version}")
+}
+
+/// The in-flight bookkeeping key for a run kind + spec.
+pub fn run_key(kind: &str, spec: &str) -> String {
+    format!("{kind}:{spec}")
+}
+
+/// State of one open 「应用版本」 flow (tool detail pane / discover versions
+/// pane): which spec, which scope the confirm dialog targets, the pin
+/// choice made inside the dialog, and the `mise use --dry-run` preview the
+/// dialog renders (Loading while the blocking call runs on a background
+/// thread; Failed keeps the raw error, AGENTS.md rule 9). Nothing here ever
+/// writes a config file — the write happens only in `run_use` after the
+/// user confirms in the dialog (rule 4).
+#[derive(Debug, Clone)]
+pub struct ApplyFlow {
+    pub spec: String,
+    pub global: bool,
+    pub pin: bool,
+    pub preview: Loadable<UsePreview>,
+}
+
+/// Which locale key presents the post-apply activation status of a tool, as
+/// a pure function of the refreshed `mise ls` rows: the tool is 已生效
+/// (`tools.active`) when some row of the CURRENT scope lists it `active`,
+/// and 已安装 · 未生效 (`discover.installed_not_active`) otherwise.
+pub fn apply_status_key(active: bool) -> &'static str {
+    if active {
+        "tools.active"
+    } else {
+        "discover.installed_not_active"
     }
 }
 
@@ -439,7 +1149,6 @@ mod install_tests {
     use mise_core::{CommandOutput, CommandRequest, CommandRunner};
     use std::sync::mpsc::Receiver;
     use std::sync::{Arc, Mutex};
-
     struct RecordingRunner;
     impl CommandRunner for RecordingRunner {
         fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
@@ -748,6 +1457,176 @@ mod search_state_tests {
 }
 
 #[cfg(test)]
+mod task_state_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner;
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            Ok(CommandOutput {
+                code: 0,
+                stdout: "[{\"name\": \"build\"}]".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Records the exact argv of every streamed `mise` invocation so the
+    /// run/watch contract (`-C` scope + verbatim task name) is pinned.
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn project_state() -> (AppState, String, Arc<Mutex<Vec<Vec<String>>>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            (
+                Mise::new(
+                    "mise".into(),
+                    Arc::new(RecordingRunner),
+                    Arc::new(RecordingStreamer { seen: seen.clone() }),
+                ),
+                seen,
+            )
+        };
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTasks(root.clone());
+        (state, root, seen)
+    }
+
+    /// Run argv: `-C <root>` first, `run`, then the verbatim task name (a
+    /// `file` task with a colon must never be split or rewritten).
+    #[test]
+    fn start_task_run_pins_run_argv_for_current_project() {
+        let (mut state, root, seen) = project_state();
+        let (session, _rx) = state.start_task_run("test:unit", false).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root,
+                "run".to_string(),
+                "test:unit".to_string(),
+            ]
+        );
+        // New session, focused, panel visible, title carries the task name.
+        assert!(state.terminal.visible);
+        assert_eq!(state.terminal.sessions[session].title, "run test:unit");
+        assert_eq!(state.terminal.active, session);
+    }
+
+    #[test]
+    fn start_task_watch_pins_watch_argv() {
+        let (mut state, root, seen) = project_state();
+        let (session, _rx) = state.start_task_run("lint", true).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root,
+                "watch".to_string(),
+                "lint".to_string(),
+            ]
+        );
+        assert_eq!(state.terminal.sessions[session].title, "watch lint");
+        // The watch is recorded so the pane can show a persistent 监听中.
+        assert!(state.task_watch_running("lint"));
+        assert!(state.task_watch_running("other").eq(&false));
+    }
+
+    /// Global tasks page: no `-C` at all (rule 2 — the global listing and
+    /// the global run are both without a project context).
+    #[test]
+    fn global_task_run_has_no_dash_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mise, seen) = {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            (
+                Mise::new(
+                    "mise".into(),
+                    Arc::new(RecordingRunner),
+                    Arc::new(RecordingStreamer { seen: seen.clone() }),
+                ),
+                seen,
+            )
+        };
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        let _ = dir; // no project in context
+        state.selection = Selection::GlobalTasks;
+        state.start_task_run("build", false).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["run".to_string(), "build".to_string()]
+        );
+        // Scope keys mirror the outdated/env pattern.
+        assert_eq!(state.tasks_scope_key().as_deref(), Some("global"));
+    }
+
+    /// A finished watch session must leave the 监听中 state (the entry is
+    /// keyed by session status; a dropped record is a no-op).
+    #[test]
+    fn task_watch_running_tracks_session_status() {
+        let (mut state, _, _seen) = project_state();
+        state.start_task_run("lint", true).unwrap();
+        // Push the exit for THIS run's session.
+        let ix = state.task_watch_sessions["lint"];
+        state.terminal.push_event_to(ix, StreamEvent::Exited(0));
+        assert!(state.task_watch_running("lint").eq(&false));
+        assert!(state.task_watch_sessions.contains_key("lint"));
+        state.finish_task_watch("lint", ix);
+        assert!(state.task_watch_sessions.contains_key("lint").eq(&false));
+
+        // A stale cleanup (WRONG session index) must not erase a newer
+        // watch's entry for the same task.
+        state.start_task_run("lint", true).unwrap();
+        let newer = state.task_watch_sessions["lint"];
+        let stale = if newer == ix { usize::MAX } else { ix };
+        state.finish_task_watch("lint", stale);
+        assert!(state.task_watch_sessions.contains_key("lint"));
+        state.finish_task_watch("lint", newer);
+        assert!(state.task_watch_sessions.contains_key("lint").eq(&false));
+
+        // A plain run never registered an entry: any guarded finish is a
+        // no-op, never a dangling removal.
+        state.start_task_run("build", false).unwrap();
+        state.finish_task_watch("build", usize::MAX);
+        assert!(state.task_watch_sessions.contains_key("build").eq(&false));
+    }
+
+    /// The pure re-entry guard: a watch may not start while one is running;
+    /// plain runs are ignored by this guard (the run key covers them).
+    #[test]
+    fn should_start_task_run_blocks_watch_reentry() {
+        assert!(!should_start_task_run(true, true));
+        assert!(should_start_task_run(true, false));
+        assert!(should_start_task_run(false, true));
+        // Plain runs never blocked by the watch condition.
+        assert!(should_start_task_run(false, false));
+    }
+
+    #[test]
+    fn tasks_scope_key_matches_project_page() {
+        let (state, root, _) = project_state();
+        assert_eq!(state.tasks_scope_key(), Some(root));
+    }
+}
+
+#[cfg(test)]
 mod registry_load_tests {
     use super::*;
     use mise_core::CoreError;
@@ -828,6 +1707,517 @@ mod registry_load_tests {
         let mut state = AppState::new(ProjectStore::default());
         state.ensure_registry().unwrap();
         assert_eq!(state.registry, Loadable::Idle);
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        stdout: String,
+    }
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(CommandOutput {
+                code: 0,
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn outdated_json() -> String {
+        r#"{"node":{"name":"node","requested":"20","current":"20.10.0","latest":"20.20.2","source":{"path":"/proj/mise.toml"}}}"#.into()
+    }
+
+    // Multi-line return type only to keep clippy's type-complexity lint off
+    // the two recording buffers this fixture hands back to each test.
+    #[allow(clippy::type_complexity)]
+    fn recording_mise(
+        stdout: String,
+    ) -> (
+        Mise,
+        Arc<Mutex<Vec<Vec<String>>>>,
+        Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let seen_runs = Arc::new(Mutex::new(Vec::new()));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mise::new(
+                "mise".into(),
+                Arc::new(RecordingRunner {
+                    seen: seen_runs.clone(),
+                    stdout,
+                }),
+                Arc::new(RecordingStreamer {
+                    seen: seen_streams.clone(),
+                }),
+            ),
+            seen_runs,
+            seen_streams,
+        )
+    }
+
+    // AGENTS.md rule 2: `outdated` (a -C subcommand) must carry the selected
+    // project root in front of the subcommand.
+    #[test]
+    fn refresh_outdated_uses_project_root_for_project_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen, _streams) = recording_mise(outdated_json());
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        state.refresh_outdated().unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["-C".to_string(), id, "outdated".into(), "--json".into()]
+        );
+        let tools = state.outdated.ready().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "node");
+    }
+
+    #[test]
+    fn refresh_outdated_omits_root_globally() {
+        let (mise, seen, _streams) = recording_mise("{}".into());
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        state.refresh_outdated().unwrap();
+
+        // The global listing must carry `--global` so the run checks the same
+        // scope that `start_upgrade` upgrades in (no `-C` anywhere — AGENTS.md
+        // rule 2: global calls never carry the project dir).
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["outdated".to_string(), "--json".into(), "--global".into()]
+        );
+    }
+
+    // AGENTS.md rule 9: bad JSON must land in `Loadable::Failed` with the raw
+    // error, never panic and never silently become an empty list.
+    #[test]
+    fn refresh_outdated_failure_keeps_raw_error() {
+        let (mise, _seen, _streams) = recording_mise("not json".into());
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+
+        assert!(state.refresh_outdated().is_err());
+        assert!(matches!(state.outdated, Loadable::Failed(_)));
+        assert_eq!(state.outdated_count(), 0);
+    }
+
+    #[test]
+    fn refresh_outdated_without_mise_leaves_idle() {
+        let mut state = AppState::new(ProjectStore::default());
+        state.refresh_outdated().unwrap();
+        assert_eq!(state.outdated, Loadable::Idle);
+    }
+
+    /// The snapshot must be tagged with its scope: project listing → the
+    /// project root, global listing → "global". Per-tool upgrade visibility
+    /// matches the CURRENT scope against this tag, so a stale snapshot from
+    /// one page can never gate an action that runs in another scope.
+    #[test]
+    fn refresh_outdated_tags_snapshot_with_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let root = projects.projects[0].path.to_string_lossy().into_owned();
+        let (mise, _seen, _streams) = recording_mise(outdated_json());
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+
+        state.selection = Selection::ProjectTools(id);
+        state.refresh_outdated().unwrap();
+        assert_eq!(state.outdated_scope, Some(root.clone()));
+
+        state.selection = Selection::Upgrade;
+        state.refresh_outdated().unwrap();
+        assert_eq!(state.outdated_scope, Some("global".into()));
+    }
+
+    /// Scope-gated visibility: an outdated snapshot taken in one scope must
+    /// be invisible on a page whose actions would run in another scope.
+    #[test]
+    fn outdated_from_current_scope_requires_matching_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, _seen, _streams) = recording_mise(outdated_json());
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+
+        // Fresh session: scope never loaded → nothing exposed.
+        state.selection = Selection::ProjectTools(id.clone());
+        assert!(state.outdated_from_current_scope().is_none());
+
+        // Load in the project scope → visible on the same project page.
+        state.refresh_outdated().unwrap();
+        let tools = state.outdated_from_current_scope().unwrap();
+        assert_eq!(tools[0].name, "node");
+
+        // Switch to the Upgrade page (global scope): the project snapshot
+        // must NOT gate global-scope actions.
+        state.selection = Selection::Upgrade;
+        assert!(state.outdated_from_current_scope().is_none());
+        assert!(state.outdated_scope != state.outdated_scope_key());
+    }
+
+    // The coalesce predicate for the async outdated fetch, incl. the
+    // fix-round-2 regression: B completed, A's fetch in flight, user back
+    // on B → must refetch B (predicate true), not coalesce with A's fetch.
+    #[test]
+    fn should_load_outdated_coalesce_cases() {
+        // Regression B → A → B: B's snapshot scope is still B, but the
+        // loadable is Loading for A's in-flight fetch → must refetch B.
+        assert!(AppState::should_load_outdated(
+            Some("A"),
+            Some("B"),
+            false,
+            "B"
+        ));
+        // In-flight fetch for the SAME scope → coalesce.
+        assert!(!AppState::should_load_outdated(
+            Some("B"),
+            Some("A"),
+            false,
+            "B"
+        ));
+        // Ready snapshot of the same scope, nothing in flight → reuse.
+        assert!(!AppState::should_load_outdated(None, Some("B"), true, "B"));
+        // Ready snapshot of a DIFFERENT scope → must load.
+        assert!(AppState::should_load_outdated(None, Some("A"), true, "B"));
+        // Failed/Loading snapshot of same scope, nothing in flight → load.
+        assert!(AppState::should_load_outdated(None, Some("B"), false, "B"));
+        // Nothing loaded at all → load.
+        assert!(AppState::should_load_outdated(None, None, false, "B"));
+    }
+
+    // The Upgrade page never sits on a project selection (Selection::Upgrade
+    // carries no project id), so the run is global-scope: `--global`, no `-C`.
+    #[test]
+    fn start_upgrade_pins_global_argv_and_opens_session() {
+        let (mise, _seen, streams) = recording_mise("{}".into());
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::Upgrade;
+
+        let (session, _rx) = state.start_upgrade(Some("node"), false).unwrap();
+        assert_eq!(session, 0);
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "upgrade".to_string(),
+                "--global".to_string(),
+                "node".to_string()
+            ]
+        );
+        assert!(state.terminal.visible);
+        assert_eq!(state.terminal.sessions.len(), 1);
+        assert_eq!(state.terminal.sessions[0].title, "upgrade node");
+        assert!(matches!(
+            state.terminal.sessions[0].status,
+            RunStatus::Running
+        ));
+    }
+
+    #[test]
+    fn start_upgrade_all_pins_bump_and_no_spec() {
+        let (mise, _seen, streams) = recording_mise("{}".into());
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::Upgrade;
+
+        let (session, _rx) = state.start_upgrade(None, true).unwrap();
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "upgrade".to_string(),
+                "--bump".to_string(),
+                "--global".to_string(),
+            ]
+        );
+        assert_eq!(state.terminal.sessions[session].title, "upgrade");
+    }
+
+    #[test]
+    fn outdated_count_is_zero_unless_ready() {
+        let mut state = AppState::new(ProjectStore::default());
+        assert_eq!(state.outdated_count(), 0);
+        state.outdated = Loadable::Ready(vec![
+            OutdatedTool {
+                name: "node".into(),
+                requested: None,
+                current: None,
+                latest: Some("20.20.2".into()),
+                source_path: None,
+            },
+            OutdatedTool {
+                name: "python".into(),
+                requested: None,
+                current: None,
+                latest: Some("3.13".into()),
+                source_path: None,
+            },
+        ]);
+        assert_eq!(state.outdated_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod apply_action_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        stdout: String,
+    }
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(CommandOutput {
+                code: 0,
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn recording_mise() -> (
+        Mise,
+        Arc<Mutex<Vec<Vec<String>>>>,
+        Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let seen_runs = Arc::new(Mutex::new(Vec::new()));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mise::new(
+                "mise".into(),
+                Arc::new(RecordingRunner {
+                    seen: seen_runs.clone(),
+                    stdout: String::new(),
+                }),
+                Arc::new(RecordingStreamer {
+                    seen: seen_streams.clone(),
+                }),
+            ),
+            seen_runs,
+            seen_streams,
+        )
+    }
+
+    /// The apply preview is a plain dry-run: the blocking `mise use --dry-run`
+    /// must carry the PROJECT scope (`-C`, no `--global`) when invoked from a
+    /// project page, exactly like the eventual `use` write would.
+    #[test]
+    fn use_preview_project_scope_passes_dash_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen, _streams) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        let (global, root) = state.use_scope(false);
+        AppState::use_preview(
+            state.mise.as_ref().unwrap(),
+            "node@20",
+            global,
+            root.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "use".to_string(),
+                "--dry-run".to_string(),
+                "node@20".to_string(),
+            ]
+        );
+    }
+
+    /// The apply preview in a project-less context (discover, upgrade, global
+    /// tools) or with an explicit global request is a `--global` dry run with
+    /// no `-C` (AGENTS.md rule 2).
+    #[test]
+    fn use_preview_global_scope_omits_dash_c() {
+        let (mise, seen, _streams) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        let (global, root) = state.use_scope(true);
+        AppState::use_preview(
+            state.mise.as_ref().unwrap(),
+            "node@20",
+            global,
+            root.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "use".to_string(),
+                "--dry-run".to_string(),
+                "--global".to_string(),
+                "node@20".to_string(),
+            ]
+        );
+    }
+
+    /// The apply write keeps the same scope as the preview, and `--pin` is
+    /// inserted after `use` (the pin choice from the confirm dialog).
+    #[test]
+    fn start_use_pins_argv_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, _seen, streams) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        let (session, _rx) = state.start_use("node@20", false, true).unwrap();
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "use".to_string(),
+                "--pin".to_string(),
+                "node@20".to_string(),
+            ]
+        );
+        assert_eq!(state.terminal.sessions[session].title, "use node@20");
+        assert!(state.terminal.visible);
+    }
+
+    // AGENTS.md rule 2 + the spec passed verbatim: backend-prefixed names are
+    // never split or rewritten, and the project root comes first.
+    #[test]
+    fn start_uninstall_pins_spec_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, _seen, streams) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        let (session, _rx) = state.start_uninstall("npm:prettier", "3").unwrap();
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "uninstall".to_string(),
+                "npm:prettier@3".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.terminal.sessions[session].title,
+            "uninstall npm:prettier@3"
+        );
+    }
+
+    /// A per-tool upgrade on a project page stays in THIS project's scope.
+    #[test]
+    fn start_upgrade_project_scope_with_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, _seen, streams) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id.clone());
+
+        state.start_upgrade(Some("node"), false).unwrap();
+        assert_eq!(
+            streams.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "upgrade".to_string(),
+                "node".to_string()
+            ]
+        );
+    }
+
+    /// Rule 4 copy keys: active rows read 已生效, everything else keeps
+    /// 「已安装 · 未生效」 until a successful apply flips the refreshed row.
+    #[test]
+    fn apply_status_key_switches_on_active() {
+        assert_eq!(apply_status_key(true), "tools.active");
+        assert_eq!(apply_status_key(false), "discover.installed_not_active");
+    }
+
+    #[test]
+    fn run_key_combines_kind_and_spec() {
+        assert_eq!(run_key("use", "node@20"), "use:node@20");
+        assert_eq!(
+            run_key("uninstall", "npm:prettier@3"),
+            "uninstall:npm:prettier@3"
+        );
+    }
+
+    #[test]
+    fn uninstall_spec_is_verbatim_tool_at_version() {
+        assert_eq!(uninstall_spec("node", "20"), "node@20");
+        assert_eq!(uninstall_spec("npm:prettier", "3.1"), "npm:prettier@3.1");
+    }
+
+    /// begin/finish/existence circle for the in-flight key, so a run cannot
+    /// be re-entered while streaming and the buttons can disable themselves.
+    #[test]
+    fn begin_run_and_finish_run_drive_is_busy() {
+        let mut state = AppState::new(ProjectStore::default());
+        assert!(!state.is_busy("use", "node@20"));
+        state.begin_run("use", "node@20");
+        assert!(state.is_busy("use", "node@20"));
+        assert!(!state.is_busy("use", "other@1"));
+        state.finish_run("use", "node@20");
+        assert!(!state.is_busy("use", "node@20"));
     }
 }
 
@@ -1048,5 +2438,560 @@ mod refresh_tests {
             seen.lock().unwrap()[0],
             vec!["ls".to_string(), "--json".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    const UNTRUSTED: &str = "mise failed (exit 1): Config files in /proj/mise.toml are not trusted. Trust them with `mise trust`.";
+
+    #[test]
+    fn detects_english_signature() {
+        assert!(is_untrusted_error(UNTRUSTED));
+        assert!(is_untrusted_error(
+            "Config files in ~/.config/mise/config.toml are not trusted. Trust them with `mise trust`."
+        ));
+    }
+
+    /// Unrelated errors that merely mention trust (a failed `mise trust`
+    /// invocation, command help text) must NOT raise the banner.
+    #[test]
+    fn trust_mentions_without_full_signature_are_rejected() {
+        assert!(!is_untrusted_error(
+            "mise failed (exit 1): mise trust: permission denied"
+        ));
+        assert!(!is_untrusted_error(
+            "Run `mise trust` to mark configs as safe"
+        ));
+        assert!(!is_untrusted_error(
+            "Config files in /proj are not trusted."
+        ));
+        assert!(!is_untrusted_error("Trust them with `mise trust`."));
+    }
+
+    #[test]
+    fn arbitrary_failure_text_is_not_untrusted() {
+        assert!(!is_untrusted_error(
+            "mise failed (exit 1): No such file or directory"
+        ));
+        assert!(!is_untrusted_error("invalid JSON from mise"));
+        assert!(!is_untrusted_error(
+            "mise failed (exit 127): mise is not installed"
+        ));
+    }
+
+    #[test]
+    fn empty_message_is_not_untrusted() {
+        assert!(!is_untrusted_error(""));
+    }
+
+    /// The global-scope error names the config FILE; the prompt points at
+    /// its parent directory so one `mise trust <dir>` covers the anything
+    /// in there.
+    #[test]
+    fn extracts_global_config_directory_from_message() {
+        assert_eq!(untrusted_target(UNTRUSTED), Some(PathBuf::from("/proj")));
+        assert_eq!(
+            untrusted_target(
+                "Config files in /Users/x/.config/mise/config.toml are not trusted. Trust them with `mise trust`.",
+            ),
+            Some(PathBuf::from("/Users/x/.config/mise"))
+        );
+        assert_eq!(untrusted_target("unrelated error"), None);
+    }
+
+    /// The file/dir discriminator is `.toml`-based, not `.`-based: a
+    /// directory whose name contains a dot must not be "promoted" to its
+    /// own parent, and a `.toml` file is resolved to its parent.
+    #[test]
+    fn dot_in_directory_name_is_not_a_config_file() {
+        assert_eq!(
+            untrusted_target(
+                "Config files in /Users/x/dev.config are not trusted. Trust them with `mise trust`."
+            ),
+            Some(PathBuf::from("/Users/x/dev.config"))
+        );
+        assert_eq!(
+            untrusted_target(
+                "Config files in /Users/x/.config/mise/config.toml are not trusted. Trust them with `mise trust`."
+            ),
+            Some(PathBuf::from("/Users/x/.config/mise"))
+        );
+    }
+
+    struct UntrustedRunner {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        stderr: String,
+    }
+    impl CommandRunner for UntrustedRunner {
+        fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(CommandOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: self.stderr.clone(),
+            })
+        }
+    }
+
+    struct NoopStreamer;
+    impl StreamingRunner for NoopStreamer {
+        fn spawn(&self, _req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn untrusted_mise(stderr: &str) -> (Mise, Arc<Mutex<Vec<Vec<String>>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = Arc::new(UntrustedRunner {
+            seen: seen.clone(),
+            stderr: stderr.into(),
+        });
+        (
+            Mise::new("mise".into(), runner, Arc::new(NoopStreamer)),
+            seen,
+        )
+    }
+
+    /// An untrusted failure on a PROJECT-scoped operation prompts for the
+    /// project root itself (mise is called with `-C` there).
+    #[test]
+    fn untrusted_error_sets_project_root_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let root = projects
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .path
+            .clone();
+
+        let (mise, _seen) = untrusted_mise(UNTRUSTED);
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id);
+
+        assert!(state.refresh_installed().is_err());
+        assert_eq!(state.trust_prompt, Some(root));
+    }
+
+    /// GLOBAL-scope operations (no `-C`) parse the config directory out of
+    /// the error text — the global `mise.toml`'s parent.
+    #[test]
+    fn untrusted_error_sets_global_config_dir_prompt() {
+        let (mise, _seen) = untrusted_mise(
+            "Config files in /Users/x/.config/mise/config.toml are not trusted. Trust them with `mise trust`.",
+        );
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        assert!(state.refresh_installed().is_err());
+        assert_eq!(
+            state.trust_prompt,
+            Some(PathBuf::from("/Users/x/.config/mise"))
+        );
+    }
+
+    /// An unrelated failure must never raise the trust banner (no
+    /// false-positive auto-prompt).
+    #[test]
+    fn untrusted_error_leaves_prompt_unset_for_other_failures() {
+        let (mise, _seen) = untrusted_mise("mise failed (exit 1): No such file or directory");
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        assert!(state.refresh_installed().is_err());
+        assert_eq!(state.trust_prompt, None);
+    }
+
+    /// The same detection fires for the outdated fetch (M2 upgrade page's
+    /// data source) — one of the wired error paths.
+    #[test]
+    fn untrusted_error_from_outdated_sets_prompt() {
+        let (mise, _seen) = untrusted_mise(UNTRUSTED);
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        assert!(state.refresh_outdated().is_err());
+        assert!(state.trust_prompt.is_some());
+    }
+
+    /// An untrusted error whose path cannot be parsed must NOT clear an
+    /// already-shown prompt — the banner only disappears after a
+    /// successful trust (rule 10: impact visibility).
+    #[test]
+    fn unparseable_untrusted_error_keeps_existing_prompt() {
+        let (mise, _seen) = untrusted_mise(
+            "mise failed (exit 1): Config files there are not trusted. Trust them with `mise trust`.",
+        );
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        let known = PathBuf::from("/Users/x/.config/mise");
+        state.trust_prompt = Some(known.clone());
+
+        assert!(state.refresh_installed().is_err());
+        assert_eq!(state.trust_prompt, Some(known));
+    }
+
+    /// The banner interpolates the path so the user can see what the trust
+    /// button will trust before pressing it (rule 10).
+    #[test]
+    fn trust_banner_interpolates_path() {
+        assert!(rust_i18n::t!("trust.banner", path = "/x").contains("/x"));
+    }
+
+    /// Blank / whitespace-only deep-search queries never reach the core.
+    #[test]
+    fn blank_deep_search_query_does_not_run() {
+        assert!(!AppState::deep_search_query_runs(""));
+        assert!(!AppState::deep_search_query_runs("   "));
+        assert!(AppState::deep_search_query_runs("node"));
+    }
+}
+
+#[cfg(test)]
+mod env_write_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingRunner;
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Records the exact argv of every streamed `mise` invocation so the env
+    /// write contract (`mise set NAME=VALUE` / `mise unset NAME`) is pinned.
+    struct RecordingStreamer {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl StreamingRunner for RecordingStreamer {
+        fn spawn(&self, req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn recording_mise() -> (Mise, Arc<Mutex<Vec<Vec<String>>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mise::new(
+                "mise".into(),
+                Arc::new(RecordingRunner),
+                Arc::new(RecordingStreamer { seen: seen.clone() }),
+            ),
+            seen,
+        )
+    }
+
+    /// Project-scope `mise set` writes through `-C <root>` and keeps the
+    /// `NAME=VALUE` pair as ONE argv element (values with spaces stay intact,
+    /// AGENTS.md rule 2 + mise-core contract).
+    #[test]
+    fn start_set_env_project_scope_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root: String = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectEnv(root.clone());
+
+        let (session, _rx) = state.start_set_env("B", "x y z", false).unwrap();
+
+        assert_eq!(session, 0);
+        assert!(state.terminal.visible);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root.clone(),
+                "set".into(),
+                "B=x y z".into()
+            ]
+        );
+        // The session title carries the command the user can read later.
+        assert_eq!(state.terminal.sessions[0].title, "set B=x y z");
+    }
+
+    /// Global scope: no `-C` ANYWHERE and `--global` AFTER the subcommand
+    /// (mise-core contract for `set`).
+    #[test]
+    fn start_set_env_global_scope_argv() {
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalEnv;
+        let backups = tempfile::tempdir().unwrap();
+        state.backup_dir = backups.path().to_path_buf();
+
+        state.start_set_env("NODE_ENV", "production", true).unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "set".to_string(),
+                "--global".into(),
+                "NODE_ENV=production".into()
+            ]
+        );
+    }
+
+    /// The resolved name helper: editing FIXES the name, adding uses the
+    /// trimmed typed text. This is what keeps `mise set "=VALUE"` impossible.
+    #[test]
+    fn resolved_env_name_editing_wins_and_both_trim() {
+        assert_eq!(resolved_env_name(Some("REAL"), "typed_junk"), "REAL");
+        assert_eq!(resolved_env_name(None, "  MY_VAR  "), "MY_VAR");
+        // No editing + empty typing resolves empty — the caller must reject.
+        assert_eq!(resolved_env_name(None, "  "), "");
+    }
+
+    /// The reload decision after a completed write: same scope, Ready
+    /// snapshot, forced ⇒ MUST reload (without `force` the coalescing
+    /// predicate would return early and keep the stale snapshot forever).
+    #[test]
+    fn should_load_env_forced_same_scope_ready_must_reload() {
+        assert!(AppState::should_load_env(None, Some("B"), true, "B", true));
+        // Not forced: the old coalescing decision still applies.
+        assert!(!AppState::should_load_env(
+            None,
+            Some("B"),
+            true,
+            "B",
+            false
+        ));
+        // Forced never swallows a differently-scoped fetch's in-flight
+        // duplicate: force reloads for the CURRENT selection only.
+        assert!(AppState::should_load_env(None, Some("A"), true, "B", true));
+    }
+
+    /// Edit targets the EDITED DECLARATION's own file via `mise set --file`
+    /// — never the page's default scope file.
+    #[test]
+    fn start_set_env_file_targets_exact_file_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root: String = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectEnv(root.clone());
+
+        state
+            .start_set_env_file("NODE_ENV", "production", Path::new("/home/x/mise.toml"))
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root,
+                "set".into(),
+                "--file".into(),
+                "/home/x/mise.toml".into(),
+                "NODE_ENV=production".into()
+            ]
+        );
+    }
+
+    /// The delete path for a row with a known source: `mise [-C dir] unset
+    /// --file <file> NAME` — one argv holds NAME untouched.
+    #[test]
+    fn start_unset_env_file_targets_exact_file_argv() {
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalEnv;
+
+        state
+            .start_unset_env_file("A", Path::new("/home/x/.config/mise/config.toml"))
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "unset".to_string(),
+                "--file".into(),
+                "/home/x/.config/mise/config.toml".into(),
+                "A".into()
+            ]
+        );
+    }
+
+    /// The dialog only shows the project-scope toggle when a project is in
+    /// context — `start_set_env` must refuse `global=false` without one
+    /// rather than silently writing globally (mislabeled scopes are dishonest).
+    #[test]
+    fn start_set_env_project_scope_without_root_is_refused() {
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalEnv;
+
+        assert!(state.start_set_env("FOO", "1", false).is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Project-scope `mise unset`: `-C <root>` before `unset`.
+    #[test]
+    fn start_unset_env_project_scope_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root: String = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectEnv(root.clone());
+
+        state.start_unset_env("B", false).unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["-C".to_string(), root.clone(), "unset".into(), "B".into()]
+        );
+        assert_eq!(state.terminal.sessions[0].title, "unset B");
+    }
+
+    /// Global `mise unset --global NAME`: `--global` AFTER the subcommand.
+    #[test]
+    fn start_unset_env_global_scope_argv() {
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalEnv;
+        let backups = tempfile::tempdir().unwrap();
+        state.backup_dir = backups.path().to_path_buf();
+
+        state.start_unset_env("NODE_ENV", true).unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["unset".to_string(), "--global".into(), "NODE_ENV".into()]
+        );
+    }
+
+    /// spec §5.4: before `use` writes, the target config file (project
+    /// root/mise.toml) is copied into the app's backup dir, the backup path
+    /// is echoed into the terminal session, and the write still goes through
+    /// mise (the app never writes config content itself).
+    #[test]
+    fn start_use_backs_up_target_config_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id: String = projects.add(dir.path()).unwrap().id.clone();
+        std::fs::write(dir.path().join("mise.toml"), b"[tools]\n").unwrap();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.backup_dir = backups.path().to_path_buf();
+        state.selection = Selection::ProjectTools(id.clone());
+
+        let (session, _rx) = state.start_use("node@20", false, true).unwrap();
+
+        let backup = state.last_backup.clone().expect("backup recorded");
+        assert_eq!(backup.parent().unwrap(), backups.path());
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            std::fs::read(dir.path().join("mise.toml")).unwrap(),
+            "backup bytes identical to the source file"
+        );
+        // The write still goes through mise (never a direct config edit).
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                id,
+                "use".to_string(),
+                "--pin".to_string(),
+                "node@20".to_string()
+            ]
+        );
+        // The session echoes where the backup landed.
+        assert!(
+            state.terminal.sessions[session]
+                .lines
+                .iter()
+                .any(|l| l.text.contains("backup: ")),
+            "terminal shows the backup path, lines={:?}",
+            state.terminal.sessions[session].lines
+        );
+    }
+
+    /// A write whose target file does not exist yet (e.g. first `mise use
+    /// --global` with no global config) produces no backup; the stale path
+    /// from a previous write must be cleared so the terminal never echoes a
+    /// backup path that belongs to a different write.
+    #[test]
+    fn backup_before_write_clears_last_backup_when_target_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let (mise, _seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.backup_dir = backups.path().to_path_buf();
+
+        // First call: target exists → backup recorded.
+        std::fs::write(dir.path().join("mise.toml"), b"[tools]\n").unwrap();
+        state
+            .backup_before_write(&dir.path().join("mise.toml"))
+            .unwrap();
+        assert!(state.last_backup.is_some(), "existing file is backed up");
+
+        // Second call: target missing → stale path must be cleared.
+        state
+            .backup_before_write(&backups.path().join("missing.toml"))
+            .unwrap();
+        assert!(
+            state.last_backup.is_none(),
+            "missing target clears the stale backup path, got {:?}",
+            state.last_backup
+        );
+    }
+
+    /// Fail closed: if the backup operation fails, the write must NOT start
+    /// (no mise invocation at all).
+    #[test]
+    fn start_use_backup_failure_refuses_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id: String = projects.add(dir.path()).unwrap().id.clone();
+        std::fs::write(dir.path().join("mise.toml"), b"[tools]\n").unwrap();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        // A FILE where the backup dir should be → create_dir_all fails.
+        let holder = tempfile::tempdir().unwrap();
+        state.backup_dir = holder.path().join("not-a-dir");
+        std::fs::write(&state.backup_dir, b"").unwrap();
+        state.selection = Selection::ProjectTools(id);
+
+        let err = state.start_use("node@20", false, true).unwrap_err();
+        assert!(matches!(err, mise_core::CoreError::Io(_)));
+        assert!(seen.lock().unwrap().is_empty(), "no write started");
+        assert!(state.terminal.sessions.is_empty());
+        assert!(state.last_backup.is_none());
     }
 }

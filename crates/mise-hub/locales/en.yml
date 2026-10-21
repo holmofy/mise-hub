@@ -5,9 +5,12 @@ common:
 nav:
   workbench: Workbench
   discover: Discover
+  upgrade: Upgrade
   tools: Tools
   tasks: Tasks
   env: Environment
+  env_project: Project environment
+  tasks_project: Project tasks
   projects: Projects
   add_project: Add project
   remove_project: Remove project
@@ -29,33 +32,76 @@ tools:
   scope: Scope
   source: Source
   install_path: Install path
+  status: Status
   active: Active
   inactive: Inactive
   overridden: Overridden
   apply: Apply version
-  apply_m2_note: Not available yet — applying a version is planned for M2
+  apply_ok: Apply
+  apply_confirm_title: Apply version
+  apply_note_project: This applies the version to the CURRENT PROJECT's config.
+  apply_note_global: This applies the version to the GLOBAL mise config (the global configuration file mise manages, not the project's).
+  apply_pin_choice: Pin mode
+  apply_pin: Pin version (--pin)
+  apply_range: Keep range (default)
+  apply_will_install: Will be installed
+  apply_will_install_none: Nothing to install — writing the config only
+  apply_config_updates: Config file(s) to change
+  apply_config_updates_none: No config file changes
+  apply_raw: mise use --dry-run output
+  apply_preview_loading: Running mise use --dry-run…
+  apply_preview_failed: Preview failed
+  apply_preview_pending_note: No confirmed plan yet — confirming now will NOT write anything.
+  apply_running: Running…
+  apply_unavailable: mise is not available
+  uninstall: Uninstall
+  uninstall_confirm_title: Uninstall version
+  uninstall_confirm_body: >-
+    Uninstall %{spec}? The version is removed from the machine ONLY — config
+    files are NOT changed; an uninstalled version listed in a config will be
+    reinstalled on the next mise run.
+  description: Description
+  url: Homepage
+  backend: Backend
+  installed_versions: Installed versions
+  config_source: Config source
+  info_loading: Loading tool details…
+  info_failed: Failed to load tool details
+  info_unavailable: mise is not available
   empty: No installed tools
   no_match: No tools match this search
   loading: Loading…
   failed: Failed to load tools
   select_tool: Select a tool
+upgrade:
+  count: "%{n} upgrade(s) available"
+  all: Upgrade all
+  row: Upgrade
+  bump: Include out-of-range versions (--bump)
+  source: Source
+  loading: Checking for outdated tools…
+  empty: Nothing to upgrade
+  failed: Failed to load outdated tools
 discover:
   search: Search tools (English keywords)
-  search_note: Local search matches English keywords only. Deep search (mise search --all, online) is not implemented until M2.
+  search_note: Local search matches English keywords only. Deep search (mise search --all, online) runs only when you explicitly click "Deep search".
   deep_search: Deep search
-  deep_search_note: mise search --all is online and ships in M2 — not implemented yet
+  online_results: Online results (mise search --all)
+  deep_loading: Searching online…
+  deep_empty: No online results
+  deep_failed: Deep search failed
   no_results: No tools match this query
   registry_empty: The tool registry is empty
   loading: Loading tool registry…
   failed: Failed to load the tool registry
   installed: Installed
   install: Install
+  install_latest: Install latest
   pick_tool: Pick a tool to see its available versions
   installed_not_active: Installed · not active yet
   installed_at_version: Installed version
   apply_project: Apply to this project
   apply_global: Apply globally
-  apply_m2_note: Not available yet — mise use is planned for M2
   loading_versions: Loading versions…
   versions_failed: Failed to load versions
   versions_unavailable: mise is not available
@@ -70,3 +116,105 @@ terminal:
   failed: Failed
   expand: Show terminal
   collapse: Collapse
+trust:
+  banner: mise config at %{path} is not trusted
+  button: Trust this config
+tasks:
+  filter: Filter tasks
+  show_hidden: Show hidden tasks
+  hide_hidden: Hide hidden tasks
+  loading: Loading tasks…
+  failed: Failed to load tasks
+  empty: No tasks in this scope
+  no_match: No task matches this filter
+  select_task: Select a task
+  hidden_marker: hidden
+  deps_count: "%{n} dependencies"
+  dependents_count: depended on by %{n}
+  run: Run
+  run_running: Running…
+  run_commands: Run commands (task.run)
+  watch: Watch
+  watching: Watching
+  watching_state: watching for changes
+  watch_stop_note: >-
+    mise-hub cannot stop a running watch — the CLI stream has no stop or
+    kill handle. The watch ends when the process exits (e.g. after a config
+    change or when mise stops it); it also ends when the app quits.
+  dependencies: Dependencies
+  depends: required before the task (depends)
+  depends_post: run after the task, even on failure (depends_post)
+  wait_for: delay start only — not run by mise (wait_for)
+  chain: Execution order
+  chain_empty: No dependencies — the task runs alone
+  chain_cycle: in a cycle
+  chain_missing: not defined in this scope
+  cycle_warn: '"%{task}" depends on a task caught in a cycle'
+  cycle_hint: >-
+    One of these dependencies is part of a cycle through depends /
+    depends_post, so mise can never finish the chain. Inspect the
+    dependency lists below before running.
+env:
+  tab_declarations: Declarations
+  tab_effective: Effective
+  tab_diff: Diff
+  loading: Loading environment…
+  failed: Failed to load environment
+  filter: Filter variables
+  add: Add variable
+  add_title: Add variable
+  edit_title: Edit variable
+  edit_ok: OK
+  edit: Edit
+  delete: Delete
+  delete_confirm_title: Delete variable
+  delete_confirm_body: >-
+    Remove variable "%{name}"? It will be removed from %{file} via "mise unset".
+  delete_confirm_scope: >-
+    Remove variable "%{name}"? It will be removed from the %{scope}
+    configuration via "mise unset".
+  name: Name
+  value: Value
+  copy: Copy value
+  copy_hidden_warn: The value is hidden — reveal it first before copying.
+  show_all: Show all values
+  hide_all: Hide all values
+  redact_note: >-
+    mise masks redact = true declarations by default; this app reads the raw
+    values via "mise set --no-redact" but keeps them masked on this page.
+    Show / hide is a display behavior of this page only.
+  ambiguous: value may be inaccurate — show it for the exact read
+  exact_loading: Reading exact value (mise set NAME)…
+  exact_failed: Exact read failed
+  copy_redacted_warn: >-
+    This value is redacted by mise; only an exact re-read produces the real
+    value.
+  edit_refuse_ambiguous: >-
+    This value could not be read exactly yet — the edit is refused so a
+    misread value cannot be written back. Click edit again once the exact
+    read has finished.
+  also_effective: declared · active
+  chain_other: other scope declaration
+  chain_effective: effective value
+  edit_scope: Write scope
+  scope_global: Global (mise set --global)
+  scope_project: This project
+  preview_cmd: Command to run
+  invalid_name: >-
+    The name must start with a letter or underscore and contain only letters,
+    digits and underscores.
+  declarations_empty: No declarations in this scope
+  effective_empty: No effective variables
+  no_match: No variable matches this filter
+  diff_col_global: Global
+  diff_col_project: Project
+  diff_col_effective: Effective
+  diff_select_project: Select a project to compare its config
+  diff_empty: Nothing to compare
+  path_section: PATH segments
+  path_empty: PATH has no segments
+  path_tool: Tool bin dir (%{tool})
+  path_config: Declared in config
+  path_system: System / inherited
+  tool_injected: Injected by tool (%{tool})
+  system: System / process environment

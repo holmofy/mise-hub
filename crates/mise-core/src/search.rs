@@ -1,4 +1,54 @@
+use crate::error::CoreError;
 use crate::types::ToolEntry;
+
+/// One row of the `mise search --all` plain-text table. Names keep any
+/// backend prefix (`npm:`, `cargo:`, …) verbatim; `url` is the trailing
+/// `http(s)://…` token when the description ends with one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepSearchHit {
+    pub name: String,
+    pub description: String,
+    pub url: Option<String>,
+}
+
+/// Parse the plain-text table printed by `mise search --no-header --all`.
+/// Each non-empty line reads `name␣␣description` (run of 2+ spaces); the
+/// description may end with a URL, which is moved to `url`. Lines without a
+/// 2+ space separator are skipped; empty input yields an empty vec.
+pub fn parse_search_table(text: &str) -> Result<Vec<DeepSearchHit>, CoreError> {
+    let mut hits = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(2, "  ");
+        let (name, rest) = match (parts.next(), parts.next()) {
+            (Some(name), Some(rest)) if !name.trim().is_empty() => (name.trim(), rest.trim()),
+            _ => continue,
+        };
+        let (url, description) = split_trailing_url(rest);
+        hits.push(DeepSearchHit {
+            name: name.to_string(),
+            description: description.to_string(),
+            url,
+        });
+    }
+    Ok(hits)
+}
+
+/// Pull the trailing `http(s)://…` token out of a table description when it
+/// is the LAST token (preceded by whitespace). An earlier occurrence — e.g.
+/// a Markdown link inside the text — stays part of the description.
+fn split_trailing_url(rest: &str) -> (Option<String>, &str) {
+    for pattern in ["https://", "http://"] {
+        if let Some(idx) = rest.rfind(pattern) {
+            let (before, candidate) = rest.split_at(idx);
+            // Token boundary: whitespace immediately before the URL, and the
+            // URL runs to the end of the description.
+            if before.ends_with(char::is_whitespace) {
+                return (Some(candidate.trim_end().to_string()), before.trim_end());
+            }
+        }
+    }
+    (None, rest)
+}
 
 pub struct SearchIndex {
     entries: Vec<ToolEntry>,
@@ -141,5 +191,78 @@ mod tests {
             &["prettier"],
         )]);
         assert_eq!(idx.search("npm:prettier", 5)[0].tool.short, "npm:prettier");
+    }
+
+    #[test]
+    fn deep_hits_parse_name_description_and_url() {
+        let input = "ripgrep                           ripgrep \
+recursively searches directories for a regex ... https://github.com/BurntSushi/ripgrep\n";
+        let hits = parse_search_table(input).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "ripgrep");
+        assert_eq!(
+            hits[0].description,
+            "ripgrep recursively searches directories for a regex ..."
+        );
+        assert_eq!(
+            hits[0].url.as_deref(),
+            Some("https://github.com/BurntSushi/ripgrep")
+        );
+    }
+
+    #[test]
+    fn deep_hits_keep_backend_prefix_verbatim() {
+        let input = "npm:ripgrep                           [ripgrep](https://github.com) \
+in a compact and cross-platform npm package.\n";
+        let hits = parse_search_table(input).unwrap();
+        assert_eq!(hits[0].name, "npm:ripgrep");
+        assert!(
+            hits[0]
+                .description
+                .contains("[ripgrep](https://github.com)")
+        );
+        assert_eq!(hits[0].url, None);
+    }
+
+    #[test]
+    fn deep_hits_may_have_no_url() {
+        let input = "cargo:ripgrep                     ripgrep is a \
+line-oriented search tool ...\n";
+        let hits = parse_search_table(input).unwrap();
+        assert_eq!(hits[0].name, "cargo:ripgrep");
+        assert_eq!(hits[0].url, None);
+        assert!(hits[0].description.contains("line-oriented"));
+    }
+
+    #[test]
+    fn deep_hits_skip_lines_without_separator_and_tolerate_empty_input() {
+        // No 2+ space separator → skipped; empty → empty vec.
+        assert_eq!(parse_search_table("").unwrap().len(), 0);
+        assert_eq!(parse_search_table("\n \n").unwrap().len(), 0);
+        assert_eq!(
+            parse_search_table("justwords no separator here\n")
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn deep_hits_parse_all_four_line_shapes() {
+        let input = "ripgrep                           ripgrep recursive search \
+... https://github.com/BurntSushi/ripgrep\ncargo:ripgrep                     ripgrep \
+is a line-oriented search tool ...\nnpm:ripgrep                       [ripgrep](https://github.com) \
+compact cross-platform package.\naqua:BurntSushi/ripgrep           ripgrep recursive search ...\n";
+        let hits = parse_search_table(input).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].name, "ripgrep");
+        assert_eq!(
+            hits[0].url.as_deref(),
+            Some("https://github.com/BurntSushi/ripgrep")
+        );
+        assert_eq!(hits[1].name, "cargo:ripgrep");
+        assert_eq!(hits[1].url, None);
+        assert_eq!(hits[2].name, "npm:ripgrep");
+        assert_eq!(hits[3].name, "aqua:BurntSushi/ripgrep");
     }
 }
