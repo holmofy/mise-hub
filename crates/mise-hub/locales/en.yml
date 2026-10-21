@@ -115,5 +115,5 @@ terminal:
   expand: Show terminal
   collapse: Collapse
 trust:
-  banner: mise config at {path} is not trusted
+  banner: mise config at %{path} is not trusted
   button: Trust this config

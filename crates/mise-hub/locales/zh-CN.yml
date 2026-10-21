@@ -113,5 +113,5 @@ terminal:
   expand: 展开终端
   collapse: 收起
 trust:
-  banner: mise 配置未受信任：{path}
+  banner: mise 配置未受信任：%{path}
   button: 信任此配置

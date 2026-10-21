@@ -485,10 +485,15 @@ impl AppState {
         if !is_untrusted_error(&message) {
             return;
         }
-        self.trust_prompt = match self.current_project_root() {
+        // A failure whose path cannot be parsed (loose matcher, wording
+        // shift) must not clear an already-shown prompt — the banner only
+        // goes away after a successful trust, never on a parse miss.
+        if let Some(target) = match self.current_project_root() {
             Some(root) => Some(root),
             None => untrusted_target(&message),
-        };
+        } {
+            self.trust_prompt = Some(target);
+        }
     }
 
     /// Pure gate for the deep-search entry: a blank (or whitespace-only)
@@ -517,11 +522,12 @@ impl AppState {
 
 /// Detects mise's untrusted-config signature in an operation's error text.
 /// Real signature (mise 2026.10.x): `Config files in <path> are not trusted.`
-/// followed by `Trust them with \`mise trust\`.` Kept deliberately narrow so
-/// an unrelated failure (network, bad JSON, missing binary) never produces a
-/// false-positive trust prompt.
+/// `Trust them with \`mise trust\`.` Both markers are required: an
+/// unrelated failure (network, bad JSON, command help mentioning trust)
+/// never produces a false-positive trust prompt.
 pub fn is_untrusted_error(message: &str) -> bool {
-    message.contains("not trusted") || message.contains("mise trust")
+    message.contains("are not trusted")
+        && (message.contains("Trust them with") || message.contains("`mise trust`"))
 }
 
 /// Extracts the directory to trust from the untrusted error message. mise
@@ -534,7 +540,7 @@ fn untrusted_target(message: &str) -> Option<PathBuf> {
     let rest = &message[start..];
     let end = rest.find(" are not trusted")?;
     let path = PathBuf::from(rest[..end].trim());
-    if path.extension().is_some() {
+    if path.to_string_lossy().ends_with(".toml") {
         path.parent().map(Path::to_path_buf).or(Some(path))
     } else {
         Some(path)
@@ -1906,8 +1912,24 @@ mod trust_tests {
     fn detects_english_signature() {
         assert!(is_untrusted_error(UNTRUSTED));
         assert!(is_untrusted_error(
-            "Config files in ~/.config/mise/config.toml are not trusted."
+            "Config files in ~/.config/mise/config.toml are not trusted. Trust them with `mise trust`."
         ));
+    }
+
+    /// Unrelated errors that merely mention trust (a failed `mise trust`
+    /// invocation, command help text) must NOT raise the banner.
+    #[test]
+    fn trust_mentions_without_full_signature_are_rejected() {
+        assert!(!is_untrusted_error(
+            "mise failed (exit 1): mise trust: permission denied"
+        ));
+        assert!(!is_untrusted_error(
+            "Run `mise trust` to mark configs as safe"
+        ));
+        assert!(!is_untrusted_error(
+            "Config files in /proj are not trusted."
+        ));
+        assert!(!is_untrusted_error("Trust them with `mise trust`."));
     }
 
     #[test]
@@ -1933,10 +1955,31 @@ mod trust_tests {
     fn extracts_global_config_directory_from_message() {
         assert_eq!(untrusted_target(UNTRUSTED), Some(PathBuf::from("/proj")));
         assert_eq!(
-            untrusted_target("Config files in /Users/x/.config/mise/config.toml are not trusted."),
+            untrusted_target(
+                "Config files in /Users/x/.config/mise/config.toml are not trusted. Trust them with `mise trust`.",
+            ),
             Some(PathBuf::from("/Users/x/.config/mise"))
         );
         assert_eq!(untrusted_target("unrelated error"), None);
+    }
+
+    /// The file/dir discriminator is `.toml`-based, not `.`-based: a
+    /// directory whose name contains a dot must not be "promoted" to its
+    /// own parent, and a `.toml` file is resolved to its parent.
+    #[test]
+    fn dot_in_directory_name_is_not_a_config_file() {
+        assert_eq!(
+            untrusted_target(
+                "Config files in /Users/x/dev.config are not trusted. Trust them with `mise trust`."
+            ),
+            Some(PathBuf::from("/Users/x/dev.config"))
+        );
+        assert_eq!(
+            untrusted_target(
+                "Config files in /Users/x/.config/mise/config.toml are not trusted. Trust them with `mise trust`."
+            ),
+            Some(PathBuf::from("/Users/x/.config/mise"))
+        );
     }
 
     struct UntrustedRunner {
@@ -2001,8 +2044,9 @@ mod trust_tests {
     /// the error text — the global `mise.toml`'s parent.
     #[test]
     fn untrusted_error_sets_global_config_dir_prompt() {
-        let (mise, _seen) =
-            untrusted_mise("Config files in /Users/x/.config/mise/config.toml are not trusted.");
+        let (mise, _seen) = untrusted_mise(
+            "Config files in /Users/x/.config/mise/config.toml are not trusted. Trust them with `mise trust`.",
+        );
         let mut state = AppState::new(ProjectStore::default());
         state.mise = Some(Arc::new(mise));
         state.selection = Selection::GlobalTools;
@@ -2038,6 +2082,32 @@ mod trust_tests {
 
         assert!(state.refresh_outdated().is_err());
         assert!(state.trust_prompt.is_some());
+    }
+
+    /// An untrusted error whose path cannot be parsed must NOT clear an
+    /// already-shown prompt — the banner only disappears after a
+    /// successful trust (rule 10: impact visibility).
+    #[test]
+    fn unparseable_untrusted_error_keeps_existing_prompt() {
+        let (mise, _seen) = untrusted_mise(
+            "mise failed (exit 1): Config files there are not trusted. Trust them with `mise trust`.",
+        );
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        let known = PathBuf::from("/Users/x/.config/mise");
+        state.trust_prompt = Some(known.clone());
+
+        assert!(state.refresh_installed().is_err());
+        assert_eq!(state.trust_prompt, Some(known));
+    }
+
+    /// The banner interpolates the path so the user can see what the trust
+    /// button will trust before pressing it (rule 10).
+    #[test]
+    fn trust_banner_interpolates_path() {
+        assert!(rust_i18n::t!("trust.banner", path = "/x").contains("/x"));
     }
 
     /// Blank / whitespace-only deep-search queries never reach the core.
