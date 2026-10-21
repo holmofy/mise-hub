@@ -149,11 +149,11 @@ tasks:
   chain_empty: No dependencies — the task runs alone
   chain_cycle: in a cycle
   chain_missing: not defined in this scope
-  cycle_warn: '"%{task}" is part of a dependency cycle'
+  cycle_warn: '"%{task}" depends on a task caught in a cycle'
   cycle_hint: >-
-    The task can reach itself through depends/depends_post, so mise can
-    never finish the chain. Inspect the dependency lists below before
-    running.
+    One of these dependencies is part of a cycle through depends /
+    depends_post, so mise can never finish the chain. Inspect the
+    dependency lists below before running.
 env:
   tab_declarations: Declarations
   tab_effective: Effective

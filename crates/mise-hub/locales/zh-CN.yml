@@ -146,9 +146,9 @@ tasks:
   chain_empty: 无依赖——任务单独运行
   chain_cycle: 处于依赖环中
   chain_missing: 本范围内未定义
-  cycle_warn: '「%{task}」处于依赖环中'
+  cycle_warn: '「%{task}」的依赖链中存在依赖环'
   cycle_hint: >-
-    该任务可以通过 depends / depends_post 访问到自身，mise 无法完成这条
+    其中一项依赖通过 depends / depends_post 卷入了依赖环，mise 无法完成这条
     链。请先检查下方的依赖列表，再决定是否运行。
 env:
   tab_declarations: 声明

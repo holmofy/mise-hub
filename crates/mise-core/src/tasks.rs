@@ -130,7 +130,11 @@ pub fn dependency_order(graph: &TaskGraph, task: &str) -> Vec<String> {
 
     let mut walk = Walk {
         deps: &deps,
+        post: &post,
         order: Vec::new(),
+        // Post deps of every node the walk visits; drained after the
+        // pre-chain walk to build the post trail.
+        post_pending: Vec::new(),
         visited: HashSet::new(),
         // True while the node is on the current DFS path: a revisit marks a
         // cycle — the node is recorded once and the descent stops, so there
@@ -141,15 +145,15 @@ pub fn dependency_order(graph: &TaskGraph, task: &str) -> Vec<String> {
     walk.visit(task);
     // Post trail: after the task, each direct and nested post dep in
     // declared order, each with its own depends chain resolved first.
-    let mut pending: Vec<&str> = post.get(task).map(|list| list.to_vec()).unwrap_or_default();
+    // The trail is fed by EVERY node the walk visits — the requested
+    // task, its pre-chain nodes, and the post deps' own chains — so a
+    // pre-chain node's own `depends_post` (e.g. `build → lint`,
+    // `lint ⇝ cleanup`) is never omitted from the order mise runs.
     let mut ix = 0;
-    while ix < pending.len() {
-        let node = pending[ix];
+    while ix < walk.post_pending.len() {
+        let node = walk.post_pending[ix];
         ix += 1;
         walk.visit(node);
-        if let Some(list) = post.get(node) {
-            pending.extend(list.iter().copied());
-        }
     }
     walk.order
 }
@@ -158,7 +162,9 @@ pub fn dependency_order(graph: &TaskGraph, task: &str) -> Vec<String> {
 /// several chains appears in the order exactly once (diamond shape).
 struct Walk<'a> {
     deps: &'a HashMap<&'a str, Vec<&'a str>>,
+    post: &'a HashMap<&'a str, Vec<&'a str>>,
     order: Vec<String>,
+    post_pending: Vec<&'a str>,
     visited: HashSet<String>,
     on_stack: HashSet<String>,
 }
@@ -171,8 +177,7 @@ impl<'a> Walk<'a> {
         if self.on_stack.contains(node) {
             // Cycle: record the member once so the runner can attempt it
             // and fail visibly, instead of dropping it silently.
-            self.visited.insert(node.to_string());
-            self.order.push(node.to_string());
+            self.record(node);
             return;
         }
         self.on_stack.insert(node.to_string());
@@ -183,8 +188,18 @@ impl<'a> Walk<'a> {
         }
         self.on_stack.remove(node);
         if !self.visited.contains(node) {
-            self.visited.insert(node.to_string());
-            self.order.push(node.to_string());
+            self.record(node);
+        }
+    }
+
+    /// Record `node` in the order (once) and queue its own `depends_post`
+    /// for the post trail — every visited node runs its post deps, not
+    /// just the requested task.
+    fn record(&mut self, node: &str) {
+        self.visited.insert(node.to_string());
+        self.order.push(node.to_string());
+        if let Some(list) = self.post.get(node) {
+            self.post_pending.extend(list.iter().copied());
         }
     }
 }
@@ -329,6 +344,23 @@ mod tests {
                 "lint".to_string(),
                 "build".to_string(),
                 "notify".to_string()
+            ]
+        );
+    }
+
+    // A pre-chain node's own depends_post must also reach the trail:
+    // build -> lint, lint ⇝ cleanup — mise runs cleanup after lint, so
+    // the displayed order must not omit it.
+    #[test]
+    fn order_trail_covers_pre_chain_nodes_post_deps() {
+        let mut g = graph(&[("build", &["lint"]), ("lint", &[])]);
+        g.post_edges = vec![("lint".to_string(), "cleanup".to_string())];
+        assert_eq!(
+            dependency_order(&g, "build"),
+            vec![
+                "lint".to_string(),
+                "build".to_string(),
+                "cleanup".to_string()
             ]
         );
     }

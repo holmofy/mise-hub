@@ -1,5 +1,7 @@
 use crate::i18n;
-use crate::state::{AppState, ApplyFlow, EnvTab, Loadable, Selection, resolved_env_name};
+use crate::state::{
+    AppState, ApplyFlow, EnvTab, Loadable, Selection, resolved_env_name, should_start_task_run,
+};
 use crate::theme;
 use crate::views::{
     discover, env, setup, sidebar, tasks, terminal, tool_detail, tool_list, upgrade,
@@ -430,6 +432,12 @@ impl RootView {
     pub(crate) fn run_task(&mut self, task: &str, watch: bool, cx: &mut Context<Self>) {
         let task = task.to_string();
         let kind = if watch { "task-watch" } else { "task-run" };
+        // Hard re-entry guard: never spawn a second `mise watch` for a task
+        // that already has a live one (the UI disables the button, but this
+        // guard must hold even if the UI guard is bypassed).
+        if !should_start_task_run(watch, self.state.task_watch_running(&task)) {
+            return;
+        }
         self.state.begin_run(kind, &task);
         let (session, rx) = match self.state.start_task_run(&task, watch) {
             Ok(pair) => pair,
@@ -437,9 +445,8 @@ impl RootView {
                 // Release the in-flight key the failed spawn took, and
                 // surface the raw error in its own terminal tab.
                 self.state.finish_run(kind, &task);
-                if watch {
-                    self.state.finish_task_watch(&task);
-                }
+                // The spawn failed BEFORE any watch session was registered,
+                // so there is no watch bookkeeping to clean up here.
                 let verb = if watch { "watch" } else { "run" };
                 let session = self.state.terminal.begin(format!("{verb} {task}"));
                 self.state
@@ -458,9 +465,10 @@ impl RootView {
             rx,
             move |this, cx| {
                 this.state.finish_run(kind, &done_task);
-                // A watch that exited is no longer 监听中; a plain run has
-                // no entry to remove (finish_task_watch is a no-op for it).
-                this.state.finish_task_watch(&done_task);
+                // A watch that exited is no longer 监听中; the session-index
+                // guard makes this idempotent: a stale run's cleanup must
+                // never erase a NEWER watch's bookkeeping for the same task.
+                this.state.finish_task_watch(&done_task, session);
                 cx.notify();
             },
             cx,

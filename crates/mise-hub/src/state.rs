@@ -657,10 +657,25 @@ impl AppState {
     }
 
     /// Drop the watch bookkeeping for a finished watch session (called on
-    /// `Exited`; non-watch (plain run) tasks never occupy an entry).
-    pub fn finish_task_watch(&mut self, task: &str) {
-        self.task_watch_sessions.remove(task);
+    /// `Exited`). The removal is guarded by the session index: an OLDER run
+    /// completing late must never erase the bookkeeping of a NEWER watch
+    /// still streaming for the same task (plain-run cleanups never registered
+    /// an entry, so the no-match guard keeps them no-ops too).
+    pub fn finish_task_watch(&mut self, task: &str, session: usize) {
+        if self.task_watch_sessions.get(task) == Some(&session) {
+            self.task_watch_sessions.remove(task);
+        }
     }
+}
+
+/// The pure re-entry guard behind starting a task action: a `mise watch`
+/// may NOT be started while a watch for the same task is already running
+/// (the UI disables the button, but this guard must hold even if the UI
+/// is bypassed — a second spawn would duplicate the watcher and let the
+/// first watch's cleanup erase the second one's state). Plain runs are
+/// handled separately by the `task-run` in-flight key.
+pub fn should_start_task_run(watch: bool, watch_running: bool) -> bool {
+    !(watch && watch_running)
 }
 
 /// The variable name a dialog write actually targets: while EDITING, the name
@@ -1484,8 +1499,35 @@ mod task_state_tests {
         state.terminal.push_event_to(ix, StreamEvent::Exited(0));
         assert!(state.task_watch_running("lint").eq(&false));
         assert!(state.task_watch_sessions.contains_key("lint"));
-        state.finish_task_watch("lint");
+        state.finish_task_watch("lint", ix);
         assert!(state.task_watch_sessions.contains_key("lint").eq(&false));
+
+        // A stale cleanup (WRONG session index) must not erase a newer
+        // watch's entry for the same task.
+        state.start_task_run("lint", true).unwrap();
+        let newer = state.task_watch_sessions["lint"];
+        let stale = if newer == ix { usize::MAX } else { ix };
+        state.finish_task_watch("lint", stale);
+        assert!(state.task_watch_sessions.contains_key("lint"));
+        state.finish_task_watch("lint", newer);
+        assert!(state.task_watch_sessions.contains_key("lint").eq(&false));
+
+        // A plain run never registered an entry: any guarded finish is a
+        // no-op, never a dangling removal.
+        state.start_task_run("build", false).unwrap();
+        state.finish_task_watch("build", usize::MAX);
+        assert!(state.task_watch_sessions.contains_key("build").eq(&false));
+    }
+
+    /// The pure re-entry guard: a watch may not start while one is running;
+    /// plain runs are ignored by this guard (the run key covers them).
+    #[test]
+    fn should_start_task_run_blocks_watch_reentry() {
+        assert!(!should_start_task_run(true, true));
+        assert!(should_start_task_run(true, false));
+        assert!(should_start_task_run(false, true));
+        // Plain runs never blocked by the watch condition.
+        assert!(should_start_task_run(false, false));
     }
 
     #[test]

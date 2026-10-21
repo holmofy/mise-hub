@@ -521,7 +521,10 @@ fn detail_pane(
                     .outline()
                     .small()
                     .label(watch_label)
-                    .disabled(run_busy)
+                    // A running watch must not be re-entrant: spawning a
+                    // second `mise watch` would duplicate the watcher and
+                    // let the first one's cleanup erase the state.
+                    .disabled(run_busy || watch_running)
                     .on_click(cx.listener({
                         move |this, _: &ClickEvent, _window, cx| {
                             this.run_task(&watch_name, true, cx);
