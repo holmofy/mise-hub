@@ -662,7 +662,7 @@ fn deep_row(cx: &mut Context<RootView>, hit: &DeepSearchHit) -> impl IntoElement
                     Button::new(SharedString::from(format!("deep-install-{install_name}")))
                         .primary()
                         .xsmall()
-                        .label(t!("discover.install").to_string())
+                        .label(t!("discover.install_latest").to_string())
                         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                             // Verbatim backend-prefixed name; `latest` keeps
                             // this the SAME install path as local results

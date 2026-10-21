@@ -82,7 +82,6 @@ discover:
   search: 搜索工具（英文关键词）
   search_note: 本地搜索仅匹配英文关键词；「深度搜索」联网执行 mise search --all，仅在您显式点击按钮时运行。
   deep_search: 深度搜索
-  deep_search_note: mise search --all 需联网——点击按钮即运行
   online_results: 联网搜索结果（mise search --all）
   deep_loading: 正在联网搜索…
   deep_empty: 联网搜索没有结果
@@ -93,6 +92,7 @@ discover:
   failed: 加载工具索引失败
   installed: 已安装
   install: 安装
+  install_latest: 安装 latest
   pick_tool: 选择一个工具查看可用版本
   installed_not_active: 已安装 · 未生效
   installed_at_version: 已安装版本
@@ -112,3 +112,6 @@ terminal:
   failed: 失败
   expand: 展开终端
   collapse: 收起
+trust:
+  banner: mise 配置未受信任：{path}
+  button: 信任此配置

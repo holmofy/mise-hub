@@ -69,7 +69,9 @@ impl RootView {
         // below). A failure is stored on `state.registry` and rendered by the
         // discover page with the raw error, so it never becomes a blank page
         // (AGENTS.md rule 9).
-        let _ = state.ensure_registry();
+        if let Err(e) = state.ensure_registry() {
+            state.note_untrusted(&e);
+        }
 
         let search_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("tools.search_installed").to_string())
@@ -161,7 +163,10 @@ impl RootView {
     pub(crate) fn refresh_installed(&mut self) {
         match self.state.refresh_installed() {
             Ok(()) => {}
-            Err(e) => self.state.installed = Loadable::Failed(e.to_string()),
+            Err(e) => {
+                self.state.note_untrusted(&e);
+                self.state.installed = Loadable::Failed(e.to_string());
+            }
         }
     }
 
@@ -174,7 +179,10 @@ impl RootView {
     pub(crate) fn refresh_outdated(&mut self) {
         match self.state.refresh_outdated() {
             Ok(()) => {}
-            Err(e) => self.state.outdated = Loadable::Failed(e.to_string()),
+            Err(e) => {
+                self.state.note_untrusted(&e);
+                self.state.outdated = Loadable::Failed(e.to_string());
+            }
         }
     }
 
@@ -233,7 +241,10 @@ impl RootView {
                     if this.state.outdated_scope_key().as_deref() == Some(expected.as_str()) {
                         this.state.outdated = match result {
                             Ok(tools) => Loadable::Ready(tools),
-                            Err(e) => Loadable::Failed(e.to_string()),
+                            Err(e) => {
+                                this.state.note_untrusted(&e);
+                                Loadable::Failed(e.to_string())
+                            }
                         };
                         this.state.outdated_scope = Some(expected);
                         cx.notify();
@@ -408,7 +419,10 @@ impl RootView {
                         {
                             flow.preview = match result {
                                 Ok(p) => Loadable::Ready(p),
-                                Err(e) => Loadable::Failed(e.to_string()),
+                                Err(e) => {
+                                    this.state.note_untrusted(&e);
+                                    Loadable::Failed(e.to_string())
+                                }
                             };
                             cx.notify();
                         }
@@ -488,6 +502,7 @@ impl RootView {
         let (session, rx) = match self.state.start_use(&spec, global, pin) {
             Ok(pair) => pair,
             Err(e) => {
+                self.state.note_untrusted(&e);
                 self.spawn_error_session(spec, "use", e, cx);
                 return;
             }
@@ -830,7 +845,9 @@ impl RootView {
     /// the raw error again if it still fails (AGENTS.md rule 9).
     pub(crate) fn retry_registry(&mut self, cx: &mut Context<Self>) {
         self.state.registry = Loadable::Loading;
-        let _ = self.state.ensure_registry();
+        if let Err(e) = self.state.ensure_registry() {
+            self.state.note_untrusted(&e);
+        }
         cx.notify();
     }
 
@@ -841,6 +858,10 @@ impl RootView {
     /// window keeps rendering while the request is in flight.
     pub(crate) fn run_deep_search(&mut self, cx: &mut Context<Self>) {
         let query = self.discover_input.read(cx).value().trim().to_string();
+        // Blank query never touches the core (online nonsense request).
+        if !AppState::deep_search_query_runs(&query) {
+            return;
+        }
         let Some(mise) = self.state.mise.clone() else {
             self.state.deep_hits =
                 Loadable::Failed(t!("discover.versions_unavailable").to_string());
@@ -866,7 +887,10 @@ impl RootView {
                     if this.state.deep_query.as_deref() == Some(expected_query.as_str()) {
                         this.state.deep_hits = match result {
                             Ok(hits) => Loadable::Ready(hits),
-                            Err(e) => Loadable::Failed(e.to_string()),
+                            Err(e) => {
+                                this.state.note_untrusted(&e);
+                                Loadable::Failed(e.to_string())
+                            }
                         };
                         cx.notify();
                     }
@@ -879,8 +903,44 @@ impl RootView {
 
     /// Retry the last deep search (its query is preserved) when it failed.
     pub(crate) fn retry_deep_search(&mut self, cx: &mut Context<Self>) {
-        if self.state.deep_query.is_some() {
+        if self
+            .state
+            .deep_query
+            .as_deref()
+            .is_some_and(AppState::deep_search_query_runs)
+        {
             self.run_deep_search(cx);
+        }
+    }
+
+    /// Explicit `mise trust <path>` for the banner path. The CLI call is
+    /// quick (no streaming) and runs synchronously like the startup loads;
+    /// the trust result refreshes what the untrusted error had blocked.
+    pub(crate) fn run_trust(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.state.trust_prompt.clone() else {
+            return;
+        };
+        let Some(mise) = self.state.mise.clone() else {
+            return;
+        };
+        match mise.trust(&path) {
+            Ok(()) => {
+                // Trust applied: drop the banner and re-run the loads an
+                // untrusted config had failed.
+                self.state.trust_prompt = None;
+                self.state.installed = Loadable::Loading;
+                self.refresh_installed();
+                self.load_outdated_for_selection(cx);
+                if matches!(self.state.registry, Loadable::Failed(_)) {
+                    self.state.registry = Loadable::Loading;
+                    let _ = self.state.ensure_registry();
+                }
+                cx.notify();
+            }
+            Err(e) => {
+                self.notice = Some(e.to_string());
+                cx.notify();
+            }
         }
     }
 
@@ -1056,6 +1116,36 @@ fn notice_banner(cx: &App, msg: &str) -> impl IntoElement {
         .child(msg.to_string())
 }
 
+/// Persistent untrusted-config banner: names the config path and offers the
+/// explicit 「信任此配置」 action. Rendered AT THE ROOT (above every page)
+/// and driven by `state.trust_prompt`, so it survives page switches until
+/// the user trusts or quit — an untrusted config breaks every mise call,
+/// not one page's.
+fn trust_banner(
+    cx: &Context<RootView>,
+    path: &std::path::Path,
+    on_trust: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .w_full()
+        .h_flex()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .text_sm()
+        .text_color(theme.warning)
+        .bg(theme.warning.opacity(0.12))
+        .child(t!("trust.banner", path = path.display().to_string()).to_string())
+        .child(
+            Button::new("trust-config")
+                .outline()
+                .xsmall()
+                .label(t!("trust.button").to_string())
+                .on_click(on_trust),
+        )
+}
+
 impl Render for RootView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.state.mise.is_none() {
@@ -1064,7 +1154,9 @@ impl Render for RootView {
                 // mise may have appeared only now (setup page path): the
                 // startup load was a no-op back then. Failures stay in
                 // `state.registry` and surface on the discover page.
-                let _ = this.state.ensure_registry();
+                if let Err(e) = this.state.ensure_registry() {
+                    this.state.note_untrusted(&e);
+                }
                 // Refresh now that mise may be present; otherwise the tools
                 // page would sit on the startup `Loading` marker forever.
                 this.refresh_installed();
@@ -1194,6 +1286,12 @@ impl Render for RootView {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .when_some(self.state.trust_prompt.clone(), |d, path| {
+                let on_trust = cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.run_trust(cx);
+                });
+                d.child(trust_banner(cx, &path, on_trust))
+            })
             .when_some(self.notice.clone(), |d, msg| {
                 d.child(notice_banner(cx, &msg))
             })

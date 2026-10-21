@@ -84,7 +84,6 @@ discover:
   search: Search tools (English keywords)
   search_note: Local search matches English keywords only. Deep search (mise search --all, online) runs only when you explicitly click "Deep search".
   deep_search: Deep search
-  deep_search_note: mise search --all is online — press the button to run it
   online_results: Online results (mise search --all)
   deep_loading: Searching online…
   deep_empty: No online results
@@ -95,6 +94,7 @@ discover:
   failed: Failed to load the tool registry
   installed: Installed
   install: Install
+  install_latest: Install latest
   pick_tool: Pick a tool to see its available versions
   installed_not_active: Installed · not active yet
   installed_at_version: Installed version
@@ -114,3 +114,6 @@ terminal:
   failed: Failed
   expand: Show terminal
   collapse: Collapse
+trust:
+  banner: mise config at {path} is not trusted
+  button: Trust this config

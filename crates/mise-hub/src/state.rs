@@ -108,6 +108,13 @@ pub struct AppState {
     /// run yet). Guards stale results against a newer query, and enables
     /// retry with the last query.
     pub deep_query: Option<String>,
+    /// Set when an operation fails with an untrusted-config signature (see
+    /// `is_untrusted_error`): the path `mise trust` should be pointed at —
+    /// the project root for project-scope operations, the config file's
+    /// directory for global ones. The root banner offers the explicit
+    /// 「信任此配置」 action; it is NEVER set automatically (no auto-trust)
+    /// and the underlying error stays visible wherever it landed (rule 9).
+    pub trust_prompt: Option<PathBuf>,
     /// Specs of destructive/long runs currently in flight
     /// (`"uninstall:node@20"`, `"use:node@20"`, …), used to disable the
     /// matching action buttons while a run cannot be re-entered safely.
@@ -136,6 +143,7 @@ impl AppState {
             tool_info_tool: None,
             deep_hits: Loadable::Idle,
             deep_query: None,
+            trust_prompt: None,
             in_flight: HashSet::new(),
         }
     }
@@ -204,7 +212,13 @@ impl AppState {
             return Ok(());
         };
         let root = self.current_project_root();
-        let set = mise.installed(root.as_deref())?;
+        let set = match mise.installed(root.as_deref()) {
+            Ok(set) => set,
+            Err(e) => {
+                self.note_untrusted(&e);
+                return Err(e);
+            }
+        };
         self.installed = Loadable::Ready(set.rows(root.as_deref()));
         Ok(())
     }
@@ -280,6 +294,7 @@ impl AppState {
                 Ok(())
             }
             Err(e) => {
+                self.note_untrusted(&e);
                 self.outdated = Loadable::Failed(e.to_string());
                 Err(e)
             }
@@ -361,7 +376,13 @@ impl AppState {
             return Err(mise_core::CoreError::NotFound);
         };
         let (global, root) = self.use_scope(global);
-        let rx = mise.use_apply_stream(spec, global, pin, root.as_deref())?;
+        let rx = match mise.use_apply_stream(spec, global, pin, root.as_deref()) {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.note_untrusted(&e);
+                return Err(e);
+            }
+        };
         let scope = if global { " (--global)" } else { "" };
         let session = self.terminal.begin(format!("use {spec}{scope}"));
         Ok((session, rx))
@@ -446,10 +467,35 @@ impl AppState {
                 Ok(())
             }
             Err(e) => {
+                self.note_untrusted(&e);
                 self.registry = Loadable::Failed(e.to_string());
                 Err(e)
             }
         }
+    }
+
+    /// Records an untrusted-config failure from ANY mise operation onto the
+    /// persistent trust banner. The banner path is the project root for
+    /// project-scope operations; global operations have no `-C` context, so
+    /// the target is parsed from the error text instead. Non-untrusted
+    /// errors are ignored (the operation's own error surface keeps showing
+    /// them verbatim — rule 9); nothing here calls `mise trust` itself.
+    pub fn note_untrusted(&mut self, err: &CoreError) {
+        let message = err.to_string();
+        if !is_untrusted_error(&message) {
+            return;
+        }
+        self.trust_prompt = match self.current_project_root() {
+            Some(root) => Some(root),
+            None => untrusted_target(&message),
+        };
+    }
+
+    /// Pure gate for the deep-search entry: a blank (or whitespace-only)
+    /// query must NOT reach the core at all — the online 「深度搜索」 (which
+    /// runs `mise search --all`) only runs for a non-empty query.
+    pub fn deep_search_query_runs(query: &str) -> bool {
+        !query.trim().is_empty()
     }
 
     /// Search or browse the loaded registry. An empty query returns every
@@ -466,6 +512,32 @@ impl AppState {
             Loadable::Ready(entries) => SearchIndex::new(entries.clone()).search(query, limit),
             _ => vec![],
         }
+    }
+}
+
+/// Detects mise's untrusted-config signature in an operation's error text.
+/// Real signature (mise 2026.10.x): `Config files in <path> are not trusted.`
+/// followed by `Trust them with \`mise trust\`.` Kept deliberately narrow so
+/// an unrelated failure (network, bad JSON, missing binary) never produces a
+/// false-positive trust prompt.
+pub fn is_untrusted_error(message: &str) -> bool {
+    message.contains("not trusted") || message.contains("mise trust")
+}
+
+/// Extracts the directory to trust from the untrusted error message. mise
+/// prints `Config files in <path> are not trusted.` where `<path>` is a
+/// config FILE (global scope: `~/.config/mise/config.toml`); the prompt
+/// points at its parent so `mise trust <dir>` covers the whole directory.
+fn untrusted_target(message: &str) -> Option<PathBuf> {
+    const HEAD: &str = "Config files in ";
+    let start = message.find(HEAD)? + HEAD.len();
+    let rest = &message[start..];
+    let end = rest.find(" are not trusted")?;
+    let path = PathBuf::from(rest[..end].trim());
+    if path.extension().is_some() {
+        path.parent().map(Path::to_path_buf).or(Some(path))
+    } else {
+        Some(path)
     }
 }
 
@@ -1817,5 +1889,162 @@ mod refresh_tests {
             seen.lock().unwrap()[0],
             vec!["ls".to_string(), "--json".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use mise_core::runner::{StreamEvent, StreamingRunner};
+    use mise_core::{CommandOutput, CommandRequest, CommandRunner};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    const UNTRUSTED: &str = "mise failed (exit 1): Config files in /proj/mise.toml are not trusted. Trust them with `mise trust`.";
+
+    #[test]
+    fn detects_english_signature() {
+        assert!(is_untrusted_error(UNTRUSTED));
+        assert!(is_untrusted_error(
+            "Config files in ~/.config/mise/config.toml are not trusted."
+        ));
+    }
+
+    #[test]
+    fn arbitrary_failure_text_is_not_untrusted() {
+        assert!(!is_untrusted_error(
+            "mise failed (exit 1): No such file or directory"
+        ));
+        assert!(!is_untrusted_error("invalid JSON from mise"));
+        assert!(!is_untrusted_error(
+            "mise failed (exit 127): mise is not installed"
+        ));
+    }
+
+    #[test]
+    fn empty_message_is_not_untrusted() {
+        assert!(!is_untrusted_error(""));
+    }
+
+    /// The global-scope error names the config FILE; the prompt points at
+    /// its parent directory so one `mise trust <dir>` covers the anything
+    /// in there.
+    #[test]
+    fn extracts_global_config_directory_from_message() {
+        assert_eq!(untrusted_target(UNTRUSTED), Some(PathBuf::from("/proj")));
+        assert_eq!(
+            untrusted_target("Config files in /Users/x/.config/mise/config.toml are not trusted."),
+            Some(PathBuf::from("/Users/x/.config/mise"))
+        );
+        assert_eq!(untrusted_target("unrelated error"), None);
+    }
+
+    struct UntrustedRunner {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        stderr: String,
+    }
+    impl CommandRunner for UntrustedRunner {
+        fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+            self.seen.lock().unwrap().push(req.args.clone());
+            Ok(CommandOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: self.stderr.clone(),
+            })
+        }
+    }
+
+    struct NoopStreamer;
+    impl StreamingRunner for NoopStreamer {
+        fn spawn(&self, _req: CommandRequest) -> Result<Receiver<StreamEvent>, CoreError> {
+            Ok(std::sync::mpsc::channel().1)
+        }
+    }
+
+    fn untrusted_mise(stderr: &str) -> (Mise, Arc<Mutex<Vec<Vec<String>>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = Arc::new(UntrustedRunner {
+            seen: seen.clone(),
+            stderr: stderr.into(),
+        });
+        (
+            Mise::new("mise".into(), runner, Arc::new(NoopStreamer)),
+            seen,
+        )
+    }
+
+    /// An untrusted failure on a PROJECT-scoped operation prompts for the
+    /// project root itself (mise is called with `-C` there).
+    #[test]
+    fn untrusted_error_sets_project_root_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let id = projects.add(dir.path()).unwrap().id.clone();
+        let root = projects
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .path
+            .clone();
+
+        let (mise, _seen) = untrusted_mise(UNTRUSTED);
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectTools(id);
+
+        assert!(state.refresh_installed().is_err());
+        assert_eq!(state.trust_prompt, Some(root));
+    }
+
+    /// GLOBAL-scope operations (no `-C`) parse the config directory out of
+    /// the error text — the global `mise.toml`'s parent.
+    #[test]
+    fn untrusted_error_sets_global_config_dir_prompt() {
+        let (mise, _seen) =
+            untrusted_mise("Config files in /Users/x/.config/mise/config.toml are not trusted.");
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        assert!(state.refresh_installed().is_err());
+        assert_eq!(
+            state.trust_prompt,
+            Some(PathBuf::from("/Users/x/.config/mise"))
+        );
+    }
+
+    /// An unrelated failure must never raise the trust banner (no
+    /// false-positive auto-prompt).
+    #[test]
+    fn untrusted_error_leaves_prompt_unset_for_other_failures() {
+        let (mise, _seen) = untrusted_mise("mise failed (exit 1): No such file or directory");
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        assert!(state.refresh_installed().is_err());
+        assert_eq!(state.trust_prompt, None);
+    }
+
+    /// The same detection fires for the outdated fetch (M2 upgrade page's
+    /// data source) — one of the wired error paths.
+    #[test]
+    fn untrusted_error_from_outdated_sets_prompt() {
+        let (mise, _seen) = untrusted_mise(UNTRUSTED);
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalTools;
+
+        assert!(state.refresh_outdated().is_err());
+        assert!(state.trust_prompt.is_some());
+    }
+
+    /// Blank / whitespace-only deep-search queries never reach the core.
+    #[test]
+    fn blank_deep_search_query_does_not_run() {
+        assert!(!AppState::deep_search_query_runs(""));
+        assert!(!AppState::deep_search_query_runs("   "));
+        assert!(AppState::deep_search_query_runs("node"));
     }
 }
