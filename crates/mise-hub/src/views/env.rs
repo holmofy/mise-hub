@@ -13,7 +13,7 @@
 //! (observed as a rustc SIGBUS). All gpui items are imported explicitly.
 
 use crate::app::RootView;
-use crate::state::{EnvTab, Loadable};
+use crate::state::{EnvTab, Loadable, resolved_env_name};
 use crate::theme::monospace_family;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Selectable as _;
@@ -32,6 +32,7 @@ use gpui_kit::{div, px};
 use mise_core::{EnvDeclaration, EnvVar, path_segments};
 use rust_i18n::t;
 use std::collections::HashSet;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested at the bottom of this file)
@@ -121,14 +122,27 @@ pub fn valid_env_name(name: &str) -> bool {
 /// project scope, `mise set --global NAME=VALUE` for global scope. The
 /// `NAME=VALUE` pair is quoted when the value contains a space so the
 /// displayed command stays paste-able.
-pub fn set_command_preview(name: &str, value: &str, global: bool, root: Option<&str>) -> String {
+pub fn set_command_preview(
+    name: &str,
+    value: &str,
+    global: bool,
+    root: Option<&str>,
+    file: Option<&str>,
+) -> String {
     let pair = format!("{name}={value}");
     let pair_display = if pair.contains(' ') {
         format!("'{}'", pair.replace('\'', "'\\''"))
     } else {
         pair
     };
-    if global {
+    if let Some(file) = file {
+        // Writing an EXISTING declaration: the declaration's own file is
+        // targeted with `--file` — exactly the command `run_set_env` runs.
+        match root {
+            Some(dir) => format!("mise -C {dir} set --file {file} {pair_display}"),
+            None => format!("mise set --file {file} {pair_display}"),
+        }
+    } else if global {
         format!("mise set --global {pair_display}")
     } else {
         format!(
@@ -136,6 +150,45 @@ pub fn set_command_preview(name: &str, value: &str, global: bool, root: Option<&
             root.unwrap_or("<missing project>")
         )
     }
+}
+
+/// Where a delete (and, similarly, an edit of an unscoped declaration)
+/// targets: the row's OWN source file when it is known (`--file` against
+/// exactly that file), otherwise the page's scope. A global-sourced row on
+/// a project page MUST resolve to its file, never to the page scope —
+/// `mise -C <project> unset NAME` would exit 0 while touching nothing
+/// (silent no-op, blocker 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsetTarget {
+    File(String),
+    Scope { global: bool },
+}
+
+/// The pure resolution. `page_global` is the CURRENT page's scope (true on a
+/// global page); it applies only in the source-unknown fallback.
+pub fn unset_target(source: Option<&str>, page_global: bool) -> UnsetTarget {
+    match source.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(file) => UnsetTarget::File(file.to_string()),
+        None => UnsetTarget::Scope {
+            global: page_global,
+        },
+    }
+}
+
+/// Declarations for the diff's PROJECT column: ONLY rows whose source lives
+/// inside the project root. The current-scope listing also contains GLOBAL
+/// declarations (fed by `mise set` in project scope); passing them through
+/// unfiltered made global-only variables LOOK like project declarations and
+/// silently never be flagged (blocker 4).
+pub fn project_scope_declarations(
+    declarations: &[EnvDeclaration],
+    root: &Path,
+) -> Vec<EnvDeclaration> {
+    declarations
+        .iter()
+        .filter(|d| d.source.starts_with(root))
+        .cloned()
+        .collect()
 }
 
 /// Declarations grouped by their source file, sources sorted, rows keeping
@@ -349,8 +402,19 @@ pub fn render(
     } else {
         declarations.ready().cloned()
     };
+    let project_root: Option<String> = {
+        let view = cx.entity().read(cx);
+        view.state
+            .current_project_root()
+            .map(|p| p.to_string_lossy().into_owned())
+    };
     let project_col: Option<Vec<EnvDeclaration>> = if project_in_context {
-        declarations.ready().cloned()
+        // Blocker 4: the current-scope listing INCLUDES global declarations;
+        // only rows sourced INSIDE the project root count as project rows.
+        declarations.ready().map(|rows| {
+            let root = project_root.clone().unwrap_or_default();
+            project_scope_declarations(rows, Path::new(&root))
+        })
     } else {
         None
     };
@@ -434,7 +498,7 @@ fn failed_body(cx: &Context<RootView>, err: &str) -> AnyElement {
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.state.env_declarations = Loadable::Loading;
                     this.state.env_effective = Loadable::Loading;
-                    this.load_env_for_selection(cx);
+                    this.load_env_for_selection(false, cx);
                 })),
         )
         .into_any_element()
@@ -1238,8 +1302,9 @@ pub fn edit_dialog_body(weak: WeakEntity<RootView>, cx: &App) -> AnyElement {
     let typed_name = dialog.name_input.read(cx).value().to_string();
     let typed_value = dialog.value_input.read(cx).value().to_string();
     // Editing keeps the name fixed (renaming would be unset + set across two
-    // files; doing it in one replace is M4+ work).
-    let effective_name = editing.clone().unwrap_or_else(|| typed_name.clone());
+    // files; doing it in one replace is M4+ work): the resolved name is BOTH
+    // what the preview shows and what the OK handler writes.
+    let effective_name = resolved_env_name(editing.as_deref(), &typed_name);
     let effective_root: Option<String> = view
         .state
         .current_project_root()
@@ -1340,6 +1405,7 @@ pub fn edit_dialog_body(weak: WeakEntity<RootView>, cx: &App) -> AnyElement {
                     &typed_value,
                     scope_global,
                     effective_root.as_deref(),
+                    dialog.editing_source.as_deref(),
                 )),
         );
 
@@ -1517,7 +1583,7 @@ mod tests {
     #[test]
     fn preview_global_command() {
         assert_eq!(
-            set_command_preview("NODE_ENV", "production", true, Some("/proj")),
+            set_command_preview("NODE_ENV", "production", true, Some("/proj"), None),
             "mise set --global NODE_ENV=production"
         );
     }
@@ -1525,7 +1591,7 @@ mod tests {
     #[test]
     fn preview_project_command_carries_root() {
         assert_eq!(
-            set_command_preview("FOO", "bar", false, Some("/my dir")),
+            set_command_preview("FOO", "bar", false, Some("/my dir"), None),
             "mise -C /my dir set FOO=bar"
         );
     }
@@ -1533,9 +1599,69 @@ mod tests {
     #[test]
     fn preview_quotes_value_with_spaces() {
         assert_eq!(
-            set_command_preview("B", "x y z", true, None),
+            set_command_preview("B", "x y z", true, None, None),
             "mise set --global 'B=x y z'"
         );
+    }
+
+    // ---- unset_target (delete resolution) ----
+
+    #[test]
+    fn delete_targets_the_row_source_file_first() {
+        // A global-sourced row on a PROJECT page must still target the exact
+        // file — the page scope (`-C proj`) would silently remove nothing.
+        assert_eq!(
+            unset_target(Some("/home/x/.config/mise/config.toml"), false),
+            UnsetTarget::File("/home/x/.config/mise/config.toml".into())
+        );
+    }
+
+    #[test]
+    fn delete_falls_back_to_page_scope_without_source() {
+        assert_eq!(
+            unset_target(None, false),
+            UnsetTarget::Scope { global: false }
+        );
+        assert_eq!(
+            unset_target(None, true),
+            UnsetTarget::Scope { global: true }
+        );
+        assert_eq!(
+            unset_target(Some("  "), true),
+            UnsetTarget::Scope { global: true }
+        );
+    }
+
+    // ---- project_scope_declarations (diff column) ----
+
+    #[test]
+    fn diff_project_column_excludes_global_rows() {
+        // The current-scope ALSO lists global declarations; a global-sourced
+        // row must not appear in the project column.
+        let root = Path::new("/proj");
+        let rows = vec![
+            decl("ENGINE", "3.0.0", "~/.config/mise/config.toml", false),
+            decl("FOO", "bar", "/proj/mise.toml", false),
+        ];
+        let project = project_scope_declarations(&rows, root);
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0].name, "FOO");
+    }
+
+    #[test]
+    fn diff_global_only_variable_is_flagged() {
+        // After the filter, the global-only variable has no project value at
+        // all — the diff flags it (global value vs project absence).
+        let rows = vec![decl("ENGINE", "3.0.0", "~/.config/mise/config.toml", false)];
+        let empty: Vec<EnvDeclaration> = vec![];
+        let eff: Vec<EnvVar> = vec![];
+        let diffs = compute_diff(
+            Some(&rows),
+            Some(&project_scope_declarations(&empty, Path::new("/proj"))),
+            &eff,
+        );
+        assert!(diffs[0].differ);
+        assert_eq!(diffs[0].project, None);
     }
 
     // ---- group_by_source ----

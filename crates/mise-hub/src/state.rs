@@ -450,6 +450,21 @@ impl AppState {
         Ok((session, rx))
     }
 
+    /// Pure coalesce predicate for the async `env` fetch. Same semantics as
+    /// `should_load_outdated` (same snapshot / in-flight keys) plus `force`:
+    /// a completed write MUST reload even though the scope and the Ready
+    /// snapshot match, because the write just added or deleted declarations.
+    pub fn should_load_env(
+        in_flight: Option<&str>,
+        completed_scope: Option<&str>,
+        completed_is_ready: bool,
+        expected: &str,
+        force: bool,
+    ) -> bool {
+        force
+            || Self::should_load_outdated(in_flight, completed_scope, completed_is_ready, expected)
+    }
+
     /// The scope key env listings/actions match against, mirroring
     /// `outdated_scope_key`: `Some(<project root>)` on a project page,
     /// `Some("global")` everywhere else.
@@ -513,6 +528,60 @@ impl AppState {
         Ok((session, rx))
     }
 
+    /// Streamed `mise [-C dir] set --file <file> NAME=VALUE`: the EDIT path.
+    /// The declaration being edited carries its own `source` file, and every
+    /// `mise set` with `--file` targets that exact file — never whatever
+    /// file the current page's scope would pick. `-C` follows the current
+    /// project context (rule 2).
+    pub fn start_set_env_file(
+        &mut self,
+        name: &str,
+        value: &str,
+        file: &Path,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let root = self.current_project_root();
+        let rx = mise.set_env_file_stream(name, value, file, root.as_deref())?;
+        let session = self.terminal.begin(format!("set {name}={value}"));
+        Ok((session, rx))
+    }
+
+    /// Streamed `mise [-C dir] unset --file <file> NAME`: the DELETE path for
+    /// a declaration with a known `source` — the exact file the row declares
+    /// in, never the page's scope (a global row on a project page would
+    /// otherwise be a silent no-op: `mise -C proj unset` exits 0, removes
+    /// nothing).
+    pub fn start_unset_env_file(
+        &mut self,
+        name: &str,
+        file: &Path,
+    ) -> Result<(usize, std::sync::mpsc::Receiver<StreamEvent>), mise_core::CoreError> {
+        let Some(mise) = &self.mise else {
+            return Err(mise_core::CoreError::NotFound);
+        };
+        let root = self.current_project_root();
+        let rx = mise.unset_env_file_stream(name, file, root.as_deref())?;
+        let session = self.terminal.begin(format!("unset {name}"));
+        Ok((session, rx))
+    }
+}
+
+/// The variable name a dialog write actually targets: while EDITING, the name
+/// is FIXED to the name being edited and the typed text (an intentionally
+/// non-editable name field / a stale buffer) must never leak into
+/// `mise set "=VALUE"` — editing wins; otherwise the trimmed typed name.
+/// Trim is deliberate: a stray space must not be written into config.
+/// Empty result is invalid — the caller must refuse the write.
+pub fn resolved_env_name(editing: Option<&str>, typed: &str) -> String {
+    match editing {
+        Some(name) => name.trim().to_string(),
+        None => typed.trim().to_string(),
+    }
+}
+
+impl AppState {
     /// Mark a run in flight (`begin_run` before streaming, `finish_run` on
     /// Exited) so matching action buttons can disable themselves.
     pub fn begin_run(&mut self, kind: &str, spec: &str) {
@@ -2314,6 +2383,88 @@ mod env_write_tests {
                 "set".to_string(),
                 "--global".into(),
                 "NODE_ENV=production".into()
+            ]
+        );
+    }
+
+    /// The resolved name helper: editing FIXES the name, adding uses the
+    /// trimmed typed text. This is what keeps `mise set "=VALUE"` impossible.
+    #[test]
+    fn resolved_env_name_editing_wins_and_both_trim() {
+        assert_eq!(resolved_env_name(Some("REAL"), "typed_junk"), "REAL");
+        assert_eq!(resolved_env_name(None, "  MY_VAR  "), "MY_VAR");
+        // No editing + empty typing resolves empty — the caller must reject.
+        assert_eq!(resolved_env_name(None, "  "), "");
+    }
+
+    /// The reload decision after a completed write: same scope, Ready
+    /// snapshot, forced ⇒ MUST reload (without `force` the coalescing
+    /// predicate would return early and keep the stale snapshot forever).
+    #[test]
+    fn should_load_env_forced_same_scope_ready_must_reload() {
+        assert!(AppState::should_load_env(None, Some("B"), true, "B", true));
+        // Not forced: the old coalescing decision still applies.
+        assert!(!AppState::should_load_env(
+            None,
+            Some("B"),
+            true,
+            "B",
+            false
+        ));
+        // Forced never swallows a differently-scoped fetch's in-flight
+        // duplicate: force reloads for the CURRENT selection only.
+        assert!(AppState::should_load_env(None, Some("A"), true, "B", true));
+    }
+
+    /// Edit targets the EDITED DECLARATION's own file via `mise set --file`
+    /// — never the page's default scope file.
+    #[test]
+    fn start_set_env_file_targets_exact_file_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut projects = ProjectStore::default();
+        let root: String = projects.add(dir.path()).unwrap().id.clone();
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(projects);
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::ProjectEnv(root.clone());
+
+        state
+            .start_set_env_file("NODE_ENV", "production", Path::new("/home/x/mise.toml"))
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "-C".to_string(),
+                root,
+                "set".into(),
+                "--file".into(),
+                "/home/x/mise.toml".into(),
+                "NODE_ENV=production".into()
+            ]
+        );
+    }
+
+    /// The delete path for a row with a known source: `mise [-C dir] unset
+    /// --file <file> NAME` — one argv holds NAME untouched.
+    #[test]
+    fn start_unset_env_file_targets_exact_file_argv() {
+        let (mise, seen) = recording_mise();
+        let mut state = AppState::new(ProjectStore::default());
+        state.mise = Some(Arc::new(mise));
+        state.selection = Selection::GlobalEnv;
+
+        state
+            .start_unset_env_file("A", Path::new("/home/x/.config/mise/config.toml"))
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec![
+                "unset".to_string(),
+                "--file".into(),
+                "/home/x/.config/mise/config.toml".into(),
+                "A".into()
             ]
         );
     }

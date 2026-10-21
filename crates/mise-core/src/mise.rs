@@ -266,6 +266,41 @@ impl Mise {
         self.spawn_stream(args)
     }
 
+    /// Streamed `mise [-C dir] set --file <file> NAME=VALUE`. Targets ONE
+    /// exact config file (the declaration's own `source`), so an edit to a
+    /// global-sourced row can never land in the project file. `--file` is the
+    /// documented flag of `mise set`; `NAME=VALUE` stays ONE argv element.
+    pub fn set_env_file_stream(
+        &self,
+        name: &str,
+        value: &str,
+        file: &Path,
+        project_root: Option<&Path>,
+    ) -> Result<Receiver<StreamEvent>, CoreError> {
+        let mut args = self.base_or_global(false, project_root);
+        args.push("set".into());
+        args.push("--file".into());
+        args.push(file.to_string_lossy().into_owned());
+        args.push(format!("{name}={value}"));
+        self.spawn_stream(args)
+    }
+
+    /// Streamed `mise [-C dir] unset --file <file> NAME`. Same contract as
+    /// `set_env_file_stream`, for the delete action.
+    pub fn unset_env_file_stream(
+        &self,
+        name: &str,
+        file: &Path,
+        project_root: Option<&Path>,
+    ) -> Result<Receiver<StreamEvent>, CoreError> {
+        let mut args = self.base_or_global(false, project_root);
+        args.push("unset".into());
+        args.push("--file".into());
+        args.push(file.to_string_lossy().into_owned());
+        args.push(name.into());
+        self.spawn_stream(args)
+    }
+
     /// Streamed `mise [-C dir] unset [--global] NAME`. `--global` must come
     /// AFTER the subcommand.
     pub fn unset_env_stream(
@@ -748,6 +783,65 @@ recursively searches directories ... https://github.com/BurntSushi/ripgrep\n";
         let (m, _, stream) = mise_rec_stream("");
         let _ = m.unset_env_stream("FOO", true, None);
         assert_eq!(stream.lock().unwrap()[0], vec!["unset", "--global", "FOO"]);
+    }
+
+    #[test]
+    fn set_env_file_stream_project_context_carries_dash_c() {
+        // Editing a declaration of an exact file inside a project context:
+        // `-C` first (AGENTS.md rule 2), then the subcommand, `--file` and
+        // the NAME=VALUE pair as ONE argv element.
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.set_env_file_stream(
+            "B",
+            "x y z",
+            Path::new("/proj/mise.toml"),
+            Some(Path::new("/proj")),
+        );
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec!["-C", "/proj", "set", "--file", "/proj/mise.toml", "B=x y z"]
+        );
+    }
+
+    #[test]
+    fn set_env_file_stream_global_context_has_no_dash_c() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.set_env_file_stream(
+            "NODE_ENV",
+            "production",
+            Path::new("/home/x/.config/mise/config.toml"),
+            None,
+        );
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec![
+                "set",
+                "--file",
+                "/home/x/.config/mise/config.toml",
+                "NODE_ENV=production"
+            ]
+        );
+    }
+
+    #[test]
+    fn unset_env_file_stream_project_context_carries_dash_c() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ =
+            m.unset_env_file_stream("B", Path::new("/proj/mise.toml"), Some(Path::new("/proj")));
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec!["-C", "/proj", "unset", "--file", "/proj/mise.toml", "B"]
+        );
+    }
+
+    #[test]
+    fn unset_env_file_stream_global_context_has_no_dash_c() {
+        let (m, _, stream) = mise_rec_stream("");
+        let _ = m.unset_env_file_stream("A", Path::new("/g.toml"), None);
+        assert_eq!(
+            stream.lock().unwrap()[0],
+            vec!["unset", "--file", "/g.toml", "A"]
+        );
     }
 
     #[test]

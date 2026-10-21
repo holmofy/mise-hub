@@ -126,6 +126,7 @@ env:
   add: 新增变量
   add_title: 新增变量
   edit_title: 编辑变量
+  edit_ok: 确定
   edit: 编辑
   delete: 删除
   delete_confirm_title: 删除变量
@@ -165,3 +166,5 @@ env:
   path_tool: 工具 bin 目录（%{tool}）
   path_config: 配置声明
   path_system: 系统 / 继承
+  tool_injected: 由工具注入（%{tool}）
+  system: 系统 / 进程环境

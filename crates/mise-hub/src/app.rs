@@ -1,5 +1,5 @@
 use crate::i18n;
-use crate::state::{AppState, ApplyFlow, EnvTab, Loadable, Selection};
+use crate::state::{AppState, ApplyFlow, EnvTab, Loadable, Selection, resolved_env_name};
 use crate::theme;
 use crate::views::{discover, env, setup, sidebar, terminal, tool_detail, tool_list, upgrade};
 use gpui_kit::component::ActiveTheme;
@@ -16,7 +16,7 @@ use gpui_kit::*;
 use mise_core::{AppSettings, CoreError, ScopeFilter, SearchHit, StreamEvent, ToolRow};
 use rust_i18n::t;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 /// Locale choices exposed by the language picker: (locale code, display label).
@@ -85,6 +85,11 @@ pub struct EnvDialogState {
     /// The variable being edited, `None` when adding a new one. While
     /// editing, the name is fixed (rename = unset + set, out of scope here).
     pub editing: Option<String>,
+    /// The declaration's OWN source file while editing — the write targets
+    /// this exact file via `mise set --file`, never the page's default scope
+    /// file. `None` while adding (the scope toggle decides) or when the
+    /// declaration has no recoverable source (page scope, stated as such).
+    pub editing_source: Option<String>,
     /// `true` = write the global config (`mise set --global`), `false` =
     /// write the CURRENT PROJECT's config (`mise -C <root> set`).
     pub scope_global: bool,
@@ -214,7 +219,7 @@ impl RootView {
             self.env_revealed.clear();
             self.env_expanded.clear();
             self.state.env_exact.clear();
-            self.load_env_for_selection(cx);
+            self.load_env_for_selection(false, cx);
         }
         cx.notify();
     }
@@ -830,19 +835,26 @@ impl RootView {
     /// selection's scope still matches, the same stale-guard pattern as
     /// `load_outdated_for_selection`. Failures land in `Loadable::Failed`
     /// with the raw message (rule 9) and feed the trust banner.
-    pub(crate) fn load_env_for_selection(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `force = true` bypasses the coalescing predicate: a JUST-FINISHED
+    /// `mise set`/`unset` leaves the scope and the Ready snapshot untouched
+    /// while the DATA it lists changed, so a plain (unforced) reload would
+    /// coalesce early and the new/deleted variable would stay invisible
+    /// until the next page switch.
+    pub(crate) fn load_env_for_selection(&mut self, force: bool, cx: &mut Context<Self>) {
         let Some(expected) = self.state.env_scope_key() else {
             return;
         };
         // Coalesce via the shared pure predicate (same semantics as for
         // `outdated`): reuse a Ready snapshot of the same scope, or an
-        // in-flight fetch for the SAME scope.
-        if !AppState::should_load_outdated(
+        // in-flight fetch for the SAME scope — unless forced.
+        if !AppState::should_load_env(
             self.state.env_in_flight.as_deref(),
             self.state.env_scope.as_deref(),
             matches!(self.state.env_declarations, Loadable::Ready(_))
                 && matches!(self.state.env_effective, Loadable::Ready(_)),
             &expected,
+            force,
         ) {
             return;
         }
@@ -1034,6 +1046,15 @@ impl RootView {
                     .map(|d| d.value.clone())
             })
         });
+        // The edited declaration's own file: the write targets THIS file
+        // (`mise set --file`), not the page's default scope file.
+        let editing_source: Option<String> = editing.as_deref().and_then(|name| {
+            self.state.env_declarations.ready().and_then(|rows| {
+                rows.iter()
+                    .find(|d| d.name == name)
+                    .map(|d| d.source.display().to_string())
+            })
+        });
         let has_project = self.state.current_project_root().is_some();
 
         let name_input =
@@ -1059,13 +1080,15 @@ impl RootView {
         });
 
         // Default scope follows the page: project page → project config,
-        // global page → global config ("write where you are").
+        // global page → global config ("write where you are"). Editing with
+        // a known source ignores the scope (the declaration's file decides).
         let scope_default_global =
             !has_project || editing.is_none() && self.state.selection.project_id().is_none();
         self.env_dialog = Some(EnvDialogState {
             name_input: name_input.clone(),
             value_input: value_input.clone(),
             editing: editing.clone(),
+            editing_source: editing_source.clone(),
             scope_global: scope_default_global,
         });
 
@@ -1102,16 +1125,23 @@ impl RootView {
                                         let typed_value =
                                             dlg.value_input.read(cx).value().to_string();
                                         let scope_global = dlg.scope_global;
-                                        if dlg.editing.is_none()
-                                            && !env::valid_env_name(&typed_name)
-                                        {
+                                        let file = dlg.editing_source.clone();
+                                        // The WRITTEN name is the RESOLVED one
+                                        // (editing fixes the name, adding uses
+                                        // the typed text) — validated, so an
+                                        // empty/invalid `NAME=VALUE` pair can
+                                        // never reach `mise set`.
+                                        let resolved_name =
+                                            resolved_env_name(dlg.editing.as_deref(), &typed_name);
+                                        if !env::valid_env_name(&resolved_name) {
                                             cx.notify();
                                             return false;
                                         }
                                         this.env_dialog = None;
                                         this.run_set_env(
-                                            &typed_name,
+                                            &resolved_name,
                                             &typed_value,
+                                            file,
                                             scope_global,
                                             cx,
                                         );
@@ -1130,17 +1160,25 @@ impl RootView {
     }
 
     /// Stream `mise set NAME=VALUE` after the dialog confirmed the preview.
-    /// Output goes to the terminal panel; on Exited the env page's data is
-    /// reloaded (the write can add/delete declarations).
+    /// With `file` set, the write targets that exact declaration file via
+    /// `mise set --file` (editing an existing declaration); otherwise the
+    /// scope toggle decides (`--global` / `-C`). Output streams to the
+    /// terminal panel; on Exited the env page data is reloaded FORCED — the
+    /// write changed the declarations while scope + Ready snapshot did not.
     pub(crate) fn run_set_env(
         &mut self,
         name: &str,
         value: &str,
+        file: Option<String>,
         global: bool,
         cx: &mut Context<Self>,
     ) {
         self.state.begin_run("env-set", name);
-        let (session, rx) = match self.state.start_set_env(name, value, global) {
+        let result = match file.as_deref() {
+            Some(file) => self.state.start_set_env_file(name, value, Path::new(file)),
+            None => self.state.start_set_env(name, value, global),
+        };
+        let (session, rx) = match result {
             Ok(pair) => pair,
             Err(e) => {
                 self.spawn_error_session(format!("{name}={value}"), "set", e, cx);
@@ -1153,16 +1191,20 @@ impl RootView {
             rx,
             move |this, cx| {
                 this.state.finish_run("env-set", &done_name);
-                this.load_env_for_selection(cx);
+                this.load_env_for_selection(true, cx);
             },
             cx,
         );
     }
 
-    /// Ask for confirmation, then stream `mise unset NAME`. The dialog names
-    /// the variable AND the source file the declaration lives in (or, when
-    /// the file is unknown, the write scope — rule 10: impact shown first;
-    /// destructive actions are never hidden).
+    /// Ask for confirmation, then stream `mise unset`.
+    ///
+    /// The target is the row's OWN source file when one is known
+    /// (`unset_target`: `mise [-C dir] unset --file <file> NAME`) — a global
+    /// row on a project page otherwise runs `mise -C proj unset NAME`, which
+    /// exits 0 while removing NOTHING (a silent no-op). Without a source the
+    /// page's scope is targeted instead, and the confirmation SAYS so (rule
+    /// 10: impact shown first; destructive actions are never hidden).
     pub(crate) fn prompt_env_delete(
         &mut self,
         name: String,
@@ -1170,18 +1212,19 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let global = self.state.selection.project_id().is_none();
-        let body = match &source {
-            Some(file) => t!(
+        let page_global = self.state.selection.project_id().is_none();
+        let target = env::unset_target(source.as_deref(), page_global);
+        let body = match &target {
+            env::UnsetTarget::File(file) => t!(
                 "env.delete_confirm_body",
                 name = name.clone(),
                 file = file.clone()
             )
             .to_string(),
-            None => t!(
+            env::UnsetTarget::Scope { global } => t!(
                 "env.delete_confirm_scope",
                 name = name.clone(),
-                scope = if global {
+                scope = if *global {
                     t!("env.scope_global").to_string()
                 } else {
                     t!("env.scope_project").to_string()
@@ -1193,6 +1236,7 @@ impl RootView {
         window.open_alert_dialog(cx, move |alert, _, _| {
             // The dialog builder may run again on rebuild; clone per build.
             let name = name.clone();
+            let target = target.clone();
             let body = body.clone();
             let weak = weak.clone();
             alert
@@ -1204,17 +1248,28 @@ impl RootView {
                 .cancel_text(t!("nav.cancel").to_string())
                 .on_ok(move |_, _, cx| {
                     if let Some(view) = weak.upgrade() {
-                        view.update(cx, |this, cx| this.run_unset_env(&name, global, cx));
+                        view.update(cx, |this, cx| this.run_unset_env(&name, target.clone(), cx));
                     }
                     true
                 })
         });
     }
 
-    /// Internal helper the delete prompt uses to actually run the unset.
-    pub(crate) fn run_unset_env(&mut self, name: &str, global: bool, cx: &mut Context<Self>) {
+    /// Internal helper the delete prompt uses to actually run the unset:
+    /// `--file` against the declaration's own file, or the page-scope form
+    /// when no source was known. On Exited the env page data reloads FORCED.
+    pub(crate) fn run_unset_env(
+        &mut self,
+        name: &str,
+        target: env::UnsetTarget,
+        cx: &mut Context<Self>,
+    ) {
         self.state.begin_run("env-unset", name);
-        let (session, rx) = match self.state.start_unset_env(name, global) {
+        let result = match &target {
+            env::UnsetTarget::File(file) => self.state.start_unset_env_file(name, Path::new(file)),
+            env::UnsetTarget::Scope { global } => self.state.start_unset_env(name, *global),
+        };
+        let (session, rx) = match result {
             Ok(pair) => pair,
             Err(e) => {
                 self.spawn_error_session(name.to_string(), "unset", e, cx);
@@ -1227,7 +1282,7 @@ impl RootView {
             rx,
             move |this, cx| {
                 this.state.finish_run("env-unset", &done_name);
-                this.load_env_for_selection(cx);
+                this.load_env_for_selection(true, cx);
             },
             cx,
         );
