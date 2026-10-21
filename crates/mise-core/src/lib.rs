@@ -23,7 +23,7 @@ pub use project::{Project, ProjectStore, default_store_path};
 pub use registry::parse_registry;
 pub use remote::parse_remote_versions;
 pub use runner::{CommandOutput, CommandRequest, CommandRunner, ProcessRunner};
-pub use search::{SearchHit, SearchIndex};
+pub use search::{DeepSearchHit, SearchHit, SearchIndex, parse_search_table};
 pub use settings::{AppSettings, default_settings_path};
 pub use tools::{InstalledSet, Scope, ScopeFilter, ToolRow, filter_rows};
 pub use types::{ConfigSource, InstalledTool, RemoteVersion, ToolEntry};

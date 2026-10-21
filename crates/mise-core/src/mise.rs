@@ -4,6 +4,7 @@ use crate::outdated::{OutdatedTool, parse_outdated};
 use crate::registry::parse_registry;
 use crate::remote::parse_remote_versions;
 use crate::runner::{CommandOutput, CommandRequest, CommandRunner, StreamEvent, StreamingRunner};
+use crate::search::{DeepSearchHit, parse_search_table};
 use crate::tools::InstalledSet;
 use crate::types::{RemoteVersion, ToolEntry, ToolInfo};
 use std::path::{Path, PathBuf};
@@ -206,6 +207,18 @@ impl Mise {
     pub fn trust(&self, dir: &Path) -> Result<(), CoreError> {
         self.run(&["trust", &dir.to_string_lossy()], None)?;
         Ok(())
+    }
+
+    /// Online, user-triggered `mise search --no-header --all <query>` wide
+    /// search. The query is passed verbatim (backend prefixes like
+    /// `cargo:x` must stay intact); non-zero exit becomes `CommandFailed`.
+    pub fn deep_search(
+        &self,
+        query: &str,
+        project_root: Option<&Path>,
+    ) -> Result<Vec<DeepSearchHit>, CoreError> {
+        let out = self.run(&["search", "--no-header", "--all", query], project_root)?;
+        parse_search_table(&out.stdout)
     }
 
     /// `-C <dir>` for project scope, `--global`-less empty for global scope
@@ -557,5 +570,59 @@ mod tests {
         let m = Mise::new("mise".into(), Arc::new(Failing), Arc::new(NoopStreamer));
         let err = m.trust(Path::new("/proj")).unwrap_err();
         assert!(matches!(err, CoreError::CommandFailed { code: 3, .. }));
+    }
+
+    // ---- M2-T4: deep search ----
+
+    const SEARCH_TABLE: &str = "ripgrep                           ripgrep \
+recursively searches directories ... https://github.com/BurntSushi/ripgrep\n";
+
+    #[test]
+    fn deep_search_argv_with_project() {
+        let (m, seen, _) = mise_rec_stream(SEARCH_TABLE);
+        let hits = m.deep_search("ripgrep", Some(Path::new("/proj"))).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["-C", "/proj", "search", "--no-header", "--all", "ripgrep"]
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "ripgrep");
+    }
+
+    #[test]
+    fn deep_search_argv_without_project() {
+        let (m, seen, _) = mise_rec_stream(SEARCH_TABLE);
+        m.deep_search("ripgrep", None).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["search", "--no-header", "--all", "ripgrep"]
+        );
+    }
+
+    #[test]
+    fn deep_search_query_with_backend_prefix_is_verbatim() {
+        let (m, seen, _) = mise_rec_stream(SEARCH_TABLE);
+        m.deep_search("cargo:ripgrep", None).unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            vec!["search", "--no-header", "--all", "cargo:ripgrep"]
+        );
+    }
+
+    #[test]
+    fn deep_search_non_zero_exit_is_command_failed() {
+        struct Failing;
+        impl CommandRunner for Failing {
+            fn run(&self, _req: &CommandRequest) -> Result<CommandOutput, CoreError> {
+                Ok(CommandOutput {
+                    code: 2,
+                    stdout: String::new(),
+                    stderr: "offline".into(),
+                })
+            }
+        }
+        let m = Mise::new("mise".into(), Arc::new(Failing), Arc::new(NoopStreamer));
+        let err = m.deep_search("ripgrep", None).unwrap_err();
+        assert!(matches!(err, CoreError::CommandFailed { code: 2, .. }));
     }
 }

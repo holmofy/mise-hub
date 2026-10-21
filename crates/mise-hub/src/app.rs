@@ -821,6 +821,7 @@ impl RootView {
             not_active_version,
             self.state.current_project_root().is_some(),
             apply_busy,
+            &self.state.deep_hits,
         )
     }
 
@@ -831,6 +832,56 @@ impl RootView {
         self.state.registry = Loadable::Loading;
         let _ = self.state.ensure_registry();
         cx.notify();
+    }
+
+    /// User-triggered deep search (`mise search --all`, online). Runs only on
+    /// the explicit 「深度搜索」 click — never per keystroke. The blocking
+    /// call runs on a background thread; the UI thread only awaits the
+    /// bridged channel (same pattern as `select_discover_tool`), so the
+    /// window keeps rendering while the request is in flight.
+    pub(crate) fn run_deep_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.discover_input.read(cx).value().trim().to_string();
+        let Some(mise) = self.state.mise.clone() else {
+            self.state.deep_hits =
+                Loadable::Failed(t!("discover.versions_unavailable").to_string());
+            cx.notify();
+            return;
+        };
+        self.state.deep_query = Some(query.clone());
+        self.state.deep_hits = Loadable::Loading;
+        cx.notify();
+
+        let root = self.state.current_project_root();
+        let (tx, rx) = async_channel::unbounded();
+        let thread_query = query.clone();
+        std::thread::spawn(move || {
+            let result = mise.deep_search(&thread_query, root.as_deref());
+            tx.send_blocking(result).ok();
+        });
+        let expected_query = query;
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    // Stale-result guard: a newer query superseded this fetch.
+                    if this.state.deep_query.as_deref() == Some(expected_query.as_str()) {
+                        this.state.deep_hits = match result {
+                            Ok(hits) => Loadable::Ready(hits),
+                            Err(e) => Loadable::Failed(e.to_string()),
+                        };
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Retry the last deep search (its query is preserved) when it failed.
+    pub(crate) fn retry_deep_search(&mut self, cx: &mut Context<Self>) {
+        if self.state.deep_query.is_some() {
+            self.run_deep_search(cx);
+        }
     }
 
     /// Open a folder picker and add the chosen folder as a project, then select

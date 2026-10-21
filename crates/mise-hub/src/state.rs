@@ -1,6 +1,7 @@
 use mise_core::manage::UsePreview;
 use mise_core::{
-    CoreError, Mise, OutdatedTool, ProjectStore, ScopeFilter, ToolEntry, ToolRow, filter_rows,
+    CoreError, DeepSearchHit, Mise, OutdatedTool, ProjectStore, ScopeFilter, ToolEntry, ToolRow,
+    filter_rows,
 };
 use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent, types::ToolInfo};
 use std::collections::HashSet;
@@ -99,6 +100,14 @@ pub struct AppState {
     pub tool_info: Loadable<ToolInfo>,
     /// Which tool `tool_info` belongs to; stale results are dropped.
     pub tool_info_tool: Option<String>,
+    /// Online wide-search results (`mise search --all`), filled ONLY on the
+    /// user's explicit 「深度搜索」 click — never per keystroke. Kept in a
+    /// separate section; it never replaces the local search list.
+    pub deep_hits: Loadable<Vec<DeepSearchHit>>,
+    /// The query the `deep_hits` snapshot belongs to (None = no deep search
+    /// run yet). Guards stale results against a newer query, and enables
+    /// retry with the last query.
+    pub deep_query: Option<String>,
     /// Specs of destructive/long runs currently in flight
     /// (`"uninstall:node@20"`, `"use:node@20"`, …), used to disable the
     /// matching action buttons while a run cannot be re-entered safely.
@@ -125,6 +134,8 @@ impl AppState {
             outdated_in_flight: None,
             tool_info: Loadable::Idle,
             tool_info_tool: None,
+            deep_hits: Loadable::Idle,
+            deep_query: None,
             in_flight: HashSet::new(),
         }
     }

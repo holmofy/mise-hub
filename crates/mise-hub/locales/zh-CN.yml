@@ -80,9 +80,13 @@ upgrade:
   failed: 加载可升级列表失败
 discover:
   search: 搜索工具（英文关键词）
-  search_note: 本地搜索仅匹配英文关键词；「深度搜索」需联网执行 mise search --all，本里程碑未实现。
+  search_note: 本地搜索仅匹配英文关键词；「深度搜索」联网执行 mise search --all，仅在您显式点击按钮时运行。
   deep_search: 深度搜索
-  deep_search_note: mise search --all 需联网，M2 提供——本里程碑未实现
+  deep_search_note: mise search --all 需联网——点击按钮即运行
+  online_results: 联网搜索结果（mise search --all）
+  deep_loading: 正在联网搜索…
+  deep_empty: 联网搜索没有结果
+  deep_failed: 深度搜索失败
   no_results: 没有匹配此查询的工具
   registry_empty: 工具索引为空
   loading: 正在加载工具索引…

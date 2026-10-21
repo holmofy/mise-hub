@@ -82,9 +82,13 @@ upgrade:
   failed: Failed to load outdated tools
 discover:
   search: Search tools (English keywords)
-  search_note: Local search matches English keywords only. Deep search (mise search --all, online) is not implemented until M2.
+  search_note: Local search matches English keywords only. Deep search (mise search --all, online) runs only when you explicitly click "Deep search".
   deep_search: Deep search
-  deep_search_note: mise search --all is online and ships in M2 — not implemented yet
+  deep_search_note: mise search --all is online — press the button to run it
+  online_results: Online results (mise search --all)
+  deep_loading: Searching online…
+  deep_empty: No online results
+  deep_failed: Deep search failed
   no_results: No tools match this query
   registry_empty: The tool registry is empty
   loading: Loading tool registry…

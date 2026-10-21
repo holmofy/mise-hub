@@ -13,6 +13,7 @@ use gpui_kit::component::v_virtual_list;
 use gpui_kit::component::{Disableable, Sizable, VirtualListScrollHandle};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use mise_core::DeepSearchHit;
 use mise_core::RemoteVersion;
 use mise_core::SearchHit;
 use mise_core::ToolEntry;
@@ -246,6 +247,7 @@ pub fn render(
     not_active_version: Option<String>,
     has_project: bool,
     apply_busy: bool,
+    deep: &Loadable<Vec<DeepSearchHit>>,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
 
@@ -359,8 +361,13 @@ pub fn render(
         }
     };
 
-    // Search bar spans the full width; results and the versions pane sit
-    // side by side below it.
+    // Deep search endpoint: the 「联网搜索结果」 section is appended below the
+    // local results so both stay visible (deep search never replaces the
+    // local list). It is filled ONLY on the user's explicit click.
+    let deep_section = deep_section(cx, deep);
+
+    // Search bar spans the full width; results, the deep-search section and
+    // the versions pane sit below it.
     div()
         .v_flex()
         .flex_1()
@@ -374,7 +381,15 @@ pub fn render(
                 .flex_row()
                 .flex_1()
                 .min_h_0()
-                .child(results)
+                .child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .child(results)
+                        .child(deep_section),
+                )
                 .child(versions_pane(
                     cx,
                     versions_tool,
@@ -407,15 +422,16 @@ fn search_bar(cx: &mut Context<RootView>, search_input: &Entity<InputState>) -> 
                         .child(Input::new(search_input).cleanable(true).small()),
                 )
                 .child(
-                    // Disabled on purpose: deep search is `mise search --all`
-                    // (online) and lands in M2. Not rendered as a dead button —
-                    // the note below explains it (AGENTS.md red line).
+                    // User-triggered online deep search (mise search --all).
+                    // It never runs automatically: only this click fires the
+                    // background fetch (AGENTS.md rule 5).
                     Button::new("deep-search")
                         .outline()
                         .small()
-                        .disabled(true)
                         .label(t!("discover.deep_search").to_string())
-                        .tooltip(t!("discover.deep_search_note").to_string()),
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.run_deep_search(cx);
+                        })),
                 ),
         )
         .child(
@@ -508,6 +524,163 @@ fn row(
                     .min_w_0()
                     .text_ellipsis()
                     .child(bins),
+            )
+        })
+}
+
+/// Online-wide-search section below the local results: label 「联网结果」, a
+/// separate loading/empty/failure state (raw error, with retry) and rows
+/// with the SAME install action as local rows. It never replaces the local
+/// list; deep results install the verbatim (backend-prefixed) name with
+/// `latest` through `start_install`.
+fn deep_section(
+    cx: &mut Context<RootView>,
+    deep: &Loadable<Vec<DeepSearchHit>>,
+) -> impl IntoElement + use<> {
+    let theme = cx.theme().clone();
+
+    // Hidden until the user triggered a deep search at least once — the
+    // local list alone is honest output at that point (no reserved space).
+    if deep == &Loadable::Idle {
+        return div();
+    }
+
+    let mut section = div()
+        .v_flex()
+        .flex_1()
+        .min_h_0()
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(theme.background);
+
+    section = section
+        .child(
+            div()
+                .px_3()
+                .pt_2()
+                .text_xs()
+                .font_medium()
+                .text_color(theme.muted_foreground)
+                .child(t!("discover.online_results").to_string()),
+        )
+        .child(match deep {
+            Loadable::Idle => div().into_any_element(),
+            Loadable::Loading => div()
+                .h_flex()
+                .px_3()
+                .py_2()
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(Spinner::new().xsmall())
+                .child(t!("discover.deep_loading").to_string())
+                .into_any_element(),
+            Loadable::Failed(err) => div()
+                .v_flex()
+                .px_3()
+                .py_2()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(t!("discover.deep_failed").to_string()),
+                )
+                .child(
+                    // Raw error verbatim (AGENTS.md rule 9), never
+                    // abstracted into a generic 「失败了」.
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .overflow_y_scrollbar()
+                        .child(err.clone()),
+                )
+                .child(
+                    Button::new("deep-search-retry")
+                        .outline()
+                        .xsmall()
+                        .label(t!("common.retry").to_string())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.retry_deep_search(cx);
+                        })),
+                )
+                .into_any_element(),
+            Loadable::Ready(hits) if hits.is_empty() => div()
+                .px_3()
+                .py_2()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(t!("discover.deep_empty").to_string())
+                .into_any_element(),
+            Loadable::Ready(hits) => {
+                let mut col = div()
+                    .v_flex()
+                    .overflow_y_scrollbar()
+                    .max_h(px(240.))
+                    .gap_0();
+                for hit in hits {
+                    col = col.child(deep_row(cx, hit).into_any_element());
+                }
+                col.into_any_element()
+            }
+        });
+    section
+}
+
+fn deep_row(cx: &mut Context<RootView>, hit: &DeepSearchHit) -> impl IntoElement {
+    let theme = cx.theme();
+    let name = hit.name.clone();
+    let install_name = name.clone();
+    let description = hit.description.clone();
+
+    div()
+        .v_flex()
+        .px_3()
+        .py_2()
+        .w_full()
+        .min_h_0()
+        .overflow_hidden()
+        .border_b_1()
+        .border_color(theme.border.opacity(0.6))
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_medium()
+                        .font_family(monospace_family())
+                        .min_w_0()
+                        .text_ellipsis()
+                        .child(name),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("deep-install-{install_name}")))
+                        .primary()
+                        .xsmall()
+                        .label(t!("discover.install").to_string())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            // Verbatim backend-prefixed name; `latest` keeps
+                            // this the SAME install path as local results
+                            // (`start_install` → `mise install <name>@latest`,
+                            // install only — never activate, rule 4).
+                            this.run_install(&install_name, "latest", cx);
+                        })),
+                ),
+        )
+        .when(!description.is_empty(), |d| {
+            d.child(
+                div()
+                    .mt_1()
+                    .text_sm()
+                    .text_color(theme.foreground.opacity(0.8))
+                    .min_w_0()
+                    .text_ellipsis()
+                    .child(description),
             )
         })
 }
