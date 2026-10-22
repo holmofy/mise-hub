@@ -52,10 +52,22 @@ fn versions_pane(
 
     let title = match tool {
         Some(tool) => tool.to_string(),
-        // The versions pane's empty state: pick a tool to load versions.
-        None => t!("discover.pick_tool").to_string(),
+        // No tool picked yet: the pane's centered body below already says
+        // 「选择一个工具查看可用版本」. Rendering it here too would print the
+        // same sentence twice (once top-left, once centered), so the title
+        // slot stays empty until a tool is actually selected.
+        None => String::new(),
     };
-    pane = pane.child(div().text_sm().font_medium().child(title));
+    // Keep the title row laid out even when empty: it owns the spacing between
+    // the search column and the versions list, and an unrendered title would
+    // collapse that gap once a tool is picked.
+    pane = pane.child(
+        div()
+            .text_sm()
+            .font_medium()
+            .min_h_5()
+            .when(!title.is_empty(), |d| d.child(title)),
+    );
 
     pane = pane.child(match (tool, versions) {
         (_, Loadable::Loading) => div()

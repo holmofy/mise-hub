@@ -2085,7 +2085,13 @@ impl RootView {
 
 fn placeholder_detail(cx: &App) -> impl IntoElement {
     let theme = cx.theme();
+    // The pane is a flex ROW (`tools_pane` puts the list and the detail side
+    // by side), so the placeholder must be a column itself for
+    // `items_center` / `justify_center` to center on both axes. Without
+    // `v_flex` the two modifiers land on a block div and the copy sits in the
+    // top-left corner of the pane.
     div()
+        .v_flex()
         .flex_1()
         .h_full()
         .items_center()
