@@ -259,6 +259,7 @@ settings:
   store_file: Project list
   update: Update check
   update_url: Manifest URL
+  update_url_placeholder: https://example.com/manifest.json
   update_check: Check for updates
   update_check_disabled: Set a manifest URL first — with no release channel configured, checking is disabled.
   update_checking: Checking…

@@ -247,6 +247,7 @@ settings:
   store_file: 项目清单
   update: 更新检查
   update_url: 清单地址
+  update_url_placeholder: https://example.com/manifest.json
   update_check: 检查更新
   update_check_disabled: 请先填写清单地址——未配置发布渠道时无法检查更新。
   update_checking: 检查中…

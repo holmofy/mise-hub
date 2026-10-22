@@ -176,7 +176,8 @@ impl RootView {
         // Settings page (M5-T2): manifest URL draft, prefilled with the
         // persisted value so the field never starts blank after a restart.
         let update_url_input = cx.new(|cx| {
-            let state = InputState::new(window, cx);
+            let state = InputState::new(window, cx)
+                .placeholder(t!("settings.update_url_placeholder").to_string());
             if settings.update_manifest_url.is_empty() {
                 state
             } else {

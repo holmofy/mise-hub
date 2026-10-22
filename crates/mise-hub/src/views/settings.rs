@@ -19,7 +19,7 @@ use crate::state::Loadable;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::InputState;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::theme::Theme;
 use gpui_kit::component::{Disableable, Sizable};
@@ -429,7 +429,7 @@ fn update_section(
                 .text_color(theme.muted_foreground)
                 .child(t!("settings.update_url").to_string()),
         )
-        .child(div().flex_1().child(update_url_input))
+        .child(div().flex_1().child(Input::new(&update_url_input).small()))
         .child(
             Button::new("settings-save-url")
                 .outline()
