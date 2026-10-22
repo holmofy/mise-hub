@@ -82,8 +82,9 @@ pub fn render(
     col = col.child(project_header(cx, collapsed, &theme));
 
     if !collapsed {
-        for project in projects {
-            col = col.child(project_item(cx, project, selection, &theme));
+        let n = projects.len();
+        for (ix, project) in projects.iter().enumerate() {
+            col = col.child(project_item(cx, project, selection, &theme, ix + 1 == n));
         }
     }
 
@@ -231,6 +232,9 @@ fn project_item(
         .rounded_md()
         .hover(|d| d.bg(theme.muted.opacity(0.6)))
         .when(selected, |d| d.bg(theme.muted))
+        // Hairline separator between project rows; the last row skips it so
+        // no dangling line hangs in the empty space below the list.
+        .when(!last, |d| d.border_b_1().border_color(theme.border.opacity(0.6)))
         .child(
             div()
                 .id(format!("project-row-{}", id))

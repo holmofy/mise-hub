@@ -99,6 +99,9 @@ fn versions_pane(
                         .items_center()
                         .justify_between()
                         .gap_2()
+                        // Hairline separator between version rows.
+                        .border_b_1()
+                        .border_color(theme.border.opacity(0.6))
                         .child(
                             div()
                                 .text_sm()
@@ -462,6 +465,9 @@ fn row(
         .w_full()
         .px_3()
         .py_2()
+        // Hairline separator between result rows (matches deep_row below).
+        .border_b_1()
+        .border_color(theme.border.opacity(0.6))
         .overflow_hidden()
         .cursor_pointer()
         .hover(|d| d.bg(theme.muted.opacity(0.6)))

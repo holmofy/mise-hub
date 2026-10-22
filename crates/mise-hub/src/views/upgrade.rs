@@ -181,6 +181,10 @@ fn row_element(cx: &mut Context<RootView>, tool: &OutdatedTool) -> impl IntoElem
         .gap_2()
         .px_3()
         .py_2()
+        // Hairline separator between rows so the outdated list reads as
+        // distinct entries, not one continuous block.
+        .border_b_1()
+        .border_color(theme.border.opacity(0.6))
         .rounded_md()
         .hover(|d| d.bg(theme.muted.opacity(0.4)))
         .child(

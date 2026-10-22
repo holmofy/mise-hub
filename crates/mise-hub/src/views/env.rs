@@ -1035,6 +1035,10 @@ fn effective_row(
         .gap_2()
         .px_3()
         .py_2()
+        // Hairline separator between rows so adjacent variables never read
+        // as one continuous block.
+        .border_b_1()
+        .border_color(theme.border.opacity(0.6))
         .rounded_md()
         .hover(|d| d.bg(theme.muted.opacity(0.4)))
         .child(
@@ -1287,6 +1291,9 @@ fn diff_row_element(cx: &Context<RootView>, row: DiffRow, project_present: bool)
         .gap_2()
         .px_3()
         .py_1p5()
+        // Hairline separator between diff rows.
+        .border_b_1()
+        .border_color(theme.border.opacity(0.6))
         .rounded_md()
         .when(row.differ, |d| d.bg(theme.warning.opacity(0.12)));
     el = el.child(

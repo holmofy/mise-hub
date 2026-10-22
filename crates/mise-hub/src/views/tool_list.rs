@@ -224,6 +224,10 @@ fn row_element(
         .id(key.clone())
         .px_3()
         .py_2()
+        // Hairline separator between rows so adjacent tools never read as
+        // one continuous block (same treatment as the discover deep rows).
+        .border_b_1()
+        .border_color(theme.border.opacity(0.6))
         .cursor_pointer()
         .hover(|d| d.bg(theme.muted.opacity(0.6)))
         .when(selected, |d| d.bg(theme.muted))
