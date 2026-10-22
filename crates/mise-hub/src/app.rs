@@ -325,13 +325,24 @@ impl RootView {
         i18n::set_locale(code);
         self.settings.locale = code.to_string();
         let _ = self.settings.save(&self.settings_path);
+        // Every InputState was created with a placeholder baked in at
+        // startup, so all of them are re-evaluated here — otherwise half
+        // the filters would keep the old language until a restart.
         let search_input = self.search_input.clone();
         let discover_input = self.discover_input.clone();
+        let env_filter_input = self.env_filter_input.clone();
+        let tasks_filter_input = self.tasks_filter_input.clone();
         search_input.update(cx, |input, cx| {
             input.set_placeholder(t!("tools.search_installed").to_string(), window, cx)
         });
         discover_input.update(cx, |input, cx| {
             input.set_placeholder(t!("discover.search").to_string(), window, cx)
+        });
+        env_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("env.filter").to_string(), window, cx)
+        });
+        tasks_filter_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("tasks.filter").to_string(), window, cx)
         });
         cx.notify();
     }
