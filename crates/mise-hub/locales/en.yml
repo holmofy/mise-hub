@@ -104,6 +104,7 @@ discover:
   loading_versions: Loading versions…
   versions_failed: Failed to load versions
   versions_unavailable: mise is not available
+  bins_label: Commands
 terminal:
   backup: "backup: %{path}"
   upgrade_all: upgrade all

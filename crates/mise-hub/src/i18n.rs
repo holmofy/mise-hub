@@ -6,6 +6,9 @@
 //! must live at the crate root for `t!` to resolve. This module keeps the
 //! runtime entry point and the user-facing locale handling.
 
+#[cfg(test)]
+use std::collections::BTreeSet;
+
 /// Initialize the internationalization layer for the application.
 ///
 /// Called once at startup with the locale loaded from settings. Later changes
@@ -35,68 +38,71 @@ pub fn locale_from_system(raw: Option<&str>) -> &'static str {
     }
 }
 
+/// Collect the dotted key paths of a locale file.
+///
+/// The parser is intentionally minimal: it only understands the shape
+/// this project uses (two-space indentation, `key:` or `key: value`
+/// lines, and `>` / `|` block scalars whose body must be skipped).
+/// Anything it cannot read is ignored — the tests' job is to compare
+/// the two files' key sets, not to validate YAML.
+///
+/// Lives at module level (not inside `mod tests`) so view modules can
+/// assert that the keys THEY render exist in every locale.
+#[cfg(test)]
+pub(crate) fn locale_keys(yaml: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    // (indent, key path) of the enclosing sections, outermost first.
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut block_indent: Option<usize> = None;
+
+    for line in yaml.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Inside a block scalar the body is free text, not keys.
+        if let Some(block) = block_indent {
+            if indent > block {
+                continue;
+            }
+            block_indent = None;
+        }
+        if trimmed.starts_with('-') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"').trim_matches('\'');
+        if key.is_empty() {
+            continue;
+        }
+        while let Some((level, _)) = stack.last() {
+            if *level >= indent {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        let path = match stack.last() {
+            Some((_, parent)) => format!("{parent}.{key}"),
+            None => key.to_string(),
+        };
+        keys.insert(path.clone());
+        stack.push((indent, path));
+
+        let value = value.trim();
+        if value.starts_with('>') || value.starts_with('|') {
+            block_indent = Some(indent);
+        }
+    }
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
-
-    /// Collect the dotted key paths of a locale file.
-    ///
-    /// The parser is intentionally minimal: it only understands the shape
-    /// this project uses (two-space indentation, `key:` or `key: value`
-    /// lines, and `>` / `|` block scalars whose body must be skipped).
-    /// Anything it cannot read is ignored — the test's job is to compare
-    /// the two files' key sets, not to validate YAML.
-    fn locale_keys(yaml: &str) -> BTreeSet<String> {
-        let mut keys = BTreeSet::new();
-        // (indent, key path) of the enclosing sections, outermost first.
-        let mut stack: Vec<(usize, String)> = Vec::new();
-        let mut block_indent: Option<usize> = None;
-
-        for line in yaml.lines() {
-            let indent = line.len() - line.trim_start().len();
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            // Inside a block scalar the body is free text, not keys.
-            if let Some(block) = block_indent {
-                if indent > block {
-                    continue;
-                }
-                block_indent = None;
-            }
-            if trimmed.starts_with('-') {
-                continue;
-            }
-            let Some((key, value)) = trimmed.split_once(':') else {
-                continue;
-            };
-            let key = key.trim().trim_matches('"').trim_matches('\'');
-            if key.is_empty() {
-                continue;
-            }
-            while let Some((level, _)) = stack.last() {
-                if *level >= indent {
-                    stack.pop();
-                } else {
-                    break;
-                }
-            }
-            let path = match stack.last() {
-                Some((_, parent)) => format!("{parent}.{key}"),
-                None => key.to_string(),
-            };
-            keys.insert(path.clone());
-            stack.push((indent, path));
-
-            let value = value.trim();
-            if value.starts_with('>') || value.starts_with('|') {
-                block_indent = Some(indent);
-            }
-        }
-        keys
-    }
 
     /// The two locale files must expose exactly the same keys: a key that
     /// exists in only one of them renders as the raw key in that language

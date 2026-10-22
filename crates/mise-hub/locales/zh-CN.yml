@@ -102,6 +102,7 @@ discover:
   loading_versions: 正在加载版本…
   versions_failed: 加载版本失败
   versions_unavailable: mise 不可用
+  bins_label: 命令
 terminal:
   backup: "备份：%{path}"
   upgrade_all: 升级全部

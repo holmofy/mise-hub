@@ -26,8 +26,8 @@ use std::rc::Rc;
 /// given in `item_sizes`, so rows must not grow beyond this; single-line
 /// text with `text_ellipsis` gives the exact accounting:
 /// py_2(16) + text_sm line(20) + mt_1(4) + text_sm line(20)
-/// + mt_1(4) + text_xs line(16) = 80.
-const ROW_HEIGHT: f32 = 80.0;
+/// + mt_1(4) + text_xs line(16) + mb_1(4) = 84.
+const ROW_HEIGHT: f32 = 84.0;
 
 fn versions_pane(
     cx: &mut Context<RootView>,
@@ -535,13 +535,34 @@ fn row(
         })
         .when(!bins.is_empty(), |d| {
             d.child(
+                // The bins line is labeled: on its own, a row of bare
+                // executable names is meaningless to anyone who does not
+                // already know mise's vocabulary. The label is a fixed-width
+                // field; the values take the rest and ellipsize.
                 div()
                     .mt_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .mb_1()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
                     .min_w_0()
-                    .text_ellipsis()
-                    .child(bins),
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(theme.muted_foreground)
+                            .flex_shrink_0()
+                            .child(t!("discover.bins_label").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.foreground.opacity(0.8))
+                            .min_w_0()
+                            .flex_1()
+                            .text_ellipsis()
+                            .child(bins),
+                    ),
             )
         })
 }
@@ -718,6 +739,34 @@ fn centered(theme: &Theme, text: String) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::registry_empty_message;
+
+    /// The bins line carries a label (「命令」 / "Commands") so the reader
+    /// knows what the third line of a row means. The key must exist in BOTH
+    /// locale files — a key missing from one renders as the raw key text
+    /// (AGENTS.md rule 8).
+    #[test]
+    fn bins_label_key_exists_in_every_locale() {
+        let en = crate::i18n::locale_keys(include_str!("../../locales/en.yml"));
+        let zh = crate::i18n::locale_keys(include_str!("../../locales/zh-CN.yml"));
+        assert!(
+            en.contains("discover.bins_label"),
+            "en.yml is missing discover.bins_label"
+        );
+        assert!(
+            zh.contains("discover.bins_label"),
+            "zh-CN.yml is missing discover.bins_label"
+        );
+    }
+
+    /// The row height is a hard budget: the virtual list lays rows out with
+    /// it, so a row that grows past it gets clipped (the bins line's
+    /// bottom margin is part of the budget).
+    #[test]
+    fn row_height_covers_the_labeled_bins_line() {
+        // py_2(16) + title text_sm(20) + mt_1(4) + description text_sm(20)
+        // + mt_1(4) + bins text_xs(16) + mb_1(4)
+        assert_eq!(super::ROW_HEIGHT, 84.0);
+    }
 
     // These tests were written first (the predicate was an inline ternary
     // inside `render` and could not be exercised): running them without the
