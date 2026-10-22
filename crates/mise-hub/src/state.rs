@@ -4,6 +4,7 @@ use mise_core::{
     filter_rows,
 };
 use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent, types::ToolInfo};
+use rust_i18n::t;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -444,8 +445,8 @@ impl AppState {
         let root = self.current_project_root();
         let global = root.is_none();
         let title = match spec {
-            Some(spec) => format!("upgrade {spec}"),
-            None => "upgrade".to_string(),
+            Some(spec) => t!("terminal.upgrade", spec = spec).to_string(),
+            None => t!("terminal.upgrade_all").to_string(),
         };
         let rx = mise.upgrade_stream(spec, bump, global, root.as_deref())?;
         let session = self.terminal.begin(title);
@@ -463,7 +464,9 @@ impl AppState {
         };
         let root = self.current_project_root();
         let rx = mise.install_stream(tool, version, root.as_deref())?;
-        let session = self.terminal.begin(format!("install {tool}@{version}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.install", spec = format!("{tool}@{version}")).to_string());
         Ok((session, rx))
     }
 
@@ -513,11 +516,15 @@ impl AppState {
             }
         };
         let scope = if global { " (--global)" } else { "" };
-        let session = self.terminal.begin(format!("use {spec}{scope}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.use", spec = format!("{spec}{scope}")).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -540,7 +547,9 @@ impl AppState {
         let spec = uninstall_spec(tool, version);
         let root = self.current_project_root();
         let rx = mise.uninstall_stream(&spec, root.as_deref())?;
-        let session = self.terminal.begin(format!("uninstall {spec}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.uninstall", spec = spec).to_string());
         Ok((session, rx))
     }
 
@@ -600,11 +609,15 @@ impl AppState {
                 .ok_or(mise_core::CoreError::NotFound)?,
         )?;
         let rx = mise.set_env_stream(name, value, global, root.as_deref())?;
-        let session = self.terminal.begin(format!("set {name}={value}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.set", spec = format!("{name}={value}")).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -636,11 +649,15 @@ impl AppState {
                 .ok_or(mise_core::CoreError::NotFound)?,
         )?;
         let rx = mise.unset_env_stream(name, global, root.as_deref())?;
-        let session = self.terminal.begin(format!("unset {name}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.unset", spec = name).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -664,11 +681,15 @@ impl AppState {
         let root = self.current_project_root();
         self.backup_before_write(file)?;
         let rx = mise.set_env_file_stream(name, value, file, root.as_deref())?;
-        let session = self.terminal.begin(format!("set {name}={value}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.set", spec = format!("{name}={value}")).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -691,11 +712,15 @@ impl AppState {
         let root = self.current_project_root();
         self.backup_before_write(file)?;
         let rx = mise.unset_env_file_stream(name, file, root.as_deref())?;
-        let session = self.terminal.begin(format!("unset {name}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.unset", spec = name).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -748,8 +773,12 @@ impl AppState {
         } else {
             mise.run_task_stream(task, root.as_deref())?
         };
-        let verb = if watch { "watch" } else { "run" };
-        let session = self.terminal.begin(format!("{verb} {task}"));
+        let title = if watch {
+            t!("terminal.watch", spec = task).to_string()
+        } else {
+            t!("terminal.run", spec = task).to_string()
+        };
+        let session = self.terminal.begin(title);
         if watch {
             self.task_watch_sessions.insert(task.to_string(), session);
         }
@@ -1987,7 +2016,9 @@ mod upgrade_tests {
                 "--global".to_string(),
             ]
         );
-        assert_eq!(state.terminal.sessions[session].title, "upgrade");
+        // The tab title names the ACTION for the user ("upgrade all");
+        // the argv above is what mise actually receives.
+        assert_eq!(state.terminal.sessions[session].title, "upgrade all");
     }
 
     #[test]

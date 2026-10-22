@@ -20,7 +20,6 @@ nav:
   confirm_remove_body: Remove this project from the list? The folder on disk is not touched.
   cancel: Cancel
   remove: Remove
-  not_available: Not available in this milestone
 setup:
   title: mise is not installed
   body: mise-hub needs the mise CLI. Install it, then click Detect again.
@@ -108,6 +107,16 @@ discover:
   versions_failed: Failed to load versions
   versions_unavailable: mise is not available
 terminal:
+  backup: "backup: %{path}"
+  upgrade_all: upgrade all
+  upgrade: upgrade %{spec}
+  install: install %{spec}
+  use: use %{spec}
+  uninstall: uninstall %{spec}
+  set: set %{spec}
+  unset: unset %{spec}
+  run: run %{spec}
+  watch: watch %{spec}
   save: Save
   copy: Copy
   clear: Clear

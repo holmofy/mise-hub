@@ -38,6 +38,97 @@ pub fn locale_from_system(raw: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// Collect the dotted key paths of a locale file.
+    ///
+    /// The parser is intentionally minimal: it only understands the shape
+    /// this project uses (two-space indentation, `key:` or `key: value`
+    /// lines, and `>` / `|` block scalars whose body must be skipped).
+    /// Anything it cannot read is ignored — the test's job is to compare
+    /// the two files' key sets, not to validate YAML.
+    fn locale_keys(yaml: &str) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        // (indent, key path) of the enclosing sections, outermost first.
+        let mut stack: Vec<(usize, String)> = Vec::new();
+        let mut block_indent: Option<usize> = None;
+
+        for line in yaml.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // Inside a block scalar the body is free text, not keys.
+            if let Some(block) = block_indent {
+                if indent > block {
+                    continue;
+                }
+                block_indent = None;
+            }
+            if trimmed.starts_with('-') {
+                continue;
+            }
+            let Some((key, value)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let key = key.trim().trim_matches('"').trim_matches('\'');
+            if key.is_empty() {
+                continue;
+            }
+            while let Some((level, _)) = stack.last() {
+                if *level >= indent {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+            let path = match stack.last() {
+                Some((_, parent)) => format!("{parent}.{key}"),
+                None => key.to_string(),
+            };
+            keys.insert(path.clone());
+            stack.push((indent, path));
+
+            let value = value.trim();
+            if value.starts_with('>') || value.starts_with('|') {
+                block_indent = Some(indent);
+            }
+        }
+        keys
+    }
+
+    /// The two locale files must expose exactly the same keys: a key that
+    /// exists in only one of them renders as the raw key in that language
+    /// (AGENTS.md rule 8).
+    #[test]
+    fn locale_files_have_identical_key_sets() {
+        let en = locale_keys(include_str!("../locales/en.yml"));
+        let zh = locale_keys(include_str!("../locales/zh-CN.yml"));
+
+        let missing_in_zh: Vec<&String> = en.difference(&zh).collect();
+        let missing_in_en: Vec<&String> = zh.difference(&en).collect();
+        assert!(
+            missing_in_zh.is_empty(),
+            "keys present in en.yml but missing in zh-CN.yml: {missing_in_zh:?}"
+        );
+        assert!(
+            missing_in_en.is_empty(),
+            "keys present in zh-CN.yml but missing in en.yml: {missing_in_en:?}"
+        );
+        assert!(!en.is_empty(), "the parser found no keys at all");
+    }
+
+    /// The parser must actually see the nested structure — a flat file
+    /// would make the parity test vacuous.
+    #[test]
+    fn locale_keys_include_nested_paths() {
+        let en = locale_keys(include_str!("../locales/en.yml"));
+        assert!(en.contains("nav.discover"));
+        assert!(en.contains("settings.probe.registry"));
+        // Block scalars must not leak their body into the key set.
+        assert!(!en.iter().any(|k| k.contains("Uninstall")));
+    }
 
     #[test]
     fn locale_from_system_maps_zh_locales() {

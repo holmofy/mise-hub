@@ -20,7 +20,6 @@ nav:
   confirm_remove_body: 从列表中移除该项目？磁盘上的文件夹不会被改动。
   cancel: 取消
   remove: 移除
-  not_available: 本里程碑暂未实现
 setup:
   title: 尚未安装 mise
   body: mise-hub 需要 mise 命令行工具。安装后点击「重新检测」。
@@ -106,6 +105,16 @@ discover:
   versions_failed: 加载版本失败
   versions_unavailable: mise 不可用
 terminal:
+  backup: "备份：%{path}"
+  upgrade_all: 升级全部
+  upgrade: 升级 %{spec}
+  install: 安装 %{spec}
+  use: 应用 %{spec}
+  uninstall: 卸载 %{spec}
+  set: 设置 %{spec}
+  unset: 取消设置 %{spec}
+  run: 运行 %{spec}
+  watch: 监听 %{spec}
   save: 保存
   copy: 复制
   clear: 清除
