@@ -1,5 +1,3 @@
-app:
-  name: mise-hub
 common:
   retry: Retry
   save: Save

@@ -4,7 +4,8 @@ use crate::state::{
 };
 use crate::theme;
 use crate::views::{
-    discover, env, settings, setup, sidebar, tasks, terminal, tool_detail, tool_list, upgrade,
+    discover, env, settings, setup, sidebar, tasks, terminal, titlebar, tool_detail, tool_list,
+    upgrade,
 };
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
@@ -14,7 +15,6 @@ use gpui_kit::component::WindowExt;
 use gpui_kit::component::button::{Button, ButtonVariant};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use mise_core::{AppSettings, CoreError, ScopeFilter, SearchHit, StreamEvent, TaskGraph, ToolRow};
@@ -2159,67 +2159,6 @@ impl Render for RootView {
         let theme_names = theme::theme_names(cx);
         let current_theme = self.settings.theme.clone();
         let current_locale = self.settings.locale.clone();
-        let weak = cx.weak_entity();
-
-        // Theme picker: lists every registered theme and applies the
-        // selection through the SHARED `apply_theme_setting` (settings
-        // page uses the same path, so persistence cannot drift).
-        let theme_picker = {
-            let weak = weak.clone();
-            let current = current_theme.clone();
-            Button::new("theme-picker")
-                .outline()
-                .small()
-                .label(current.clone())
-                .dropdown_menu(move |menu, _, _| {
-                    theme_names.iter().cloned().fold(menu, |menu, name| {
-                        menu.item(
-                            PopupMenuItem::new(name.clone())
-                                .checked(name == current)
-                                .on_click({
-                                    let weak = weak.clone();
-                                    let name = name.clone();
-                                    move |_, window, cx| {
-                                        if let Some(view) = weak.upgrade() {
-                                            view.update(cx, |this, cx| {
-                                                this.apply_theme_setting(name.clone(), window, cx);
-                                            });
-                                        }
-                                    }
-                                }),
-                        )
-                    })
-                })
-        };
-
-        // Language picker: switches locale through the SHARED
-        // `apply_locale_setting` (persist + re-bake placeholders).
-        let language_picker = {
-            let weak = weak.clone();
-            let current = current_locale.clone();
-            Button::new("language-picker")
-                .outline()
-                .small()
-                .label(Self::locale_label(&current))
-                .dropdown_menu(move |menu, _, _| {
-                    LOCALES.into_iter().fold(menu, |menu, (code, label)| {
-                        menu.item(
-                            PopupMenuItem::new(label)
-                                .checked(code == current.as_str())
-                                .on_click({
-                                    let weak = weak.clone();
-                                    move |_, window, cx| {
-                                        if let Some(view) = weak.upgrade() {
-                                            view.update(cx, |this, cx| {
-                                                this.apply_locale_setting(code, window, cx);
-                                            });
-                                        }
-                                    }
-                                }),
-                        )
-                    })
-                })
-        };
 
         let right_pane = match &self.state.selection {
             Selection::GlobalTools | Selection::ProjectTools(_) => {
@@ -2264,29 +2203,15 @@ impl Render for RootView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(
-                div()
-                    .h_flex()
-                    .w_full()
-                    .justify_between()
-                    .px_4()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(t!("app.name").to_string()),
-                    )
-                    .child(
-                        div()
-                            .h_flex()
-                            .gap_2()
-                            .child(language_picker)
-                            .child(theme_picker),
-                    ),
-            )
+            // Custom title bar: the native traffic lights stay (see
+            // `main.rs`), the app title is gone, and the language / theme
+            // pickers live on this row instead of a separate header.
+            .child(titlebar::render(
+                cx,
+                &theme_names,
+                &current_theme,
+                &current_locale,
+            ))
             .child(
                 div()
                     .flex()
