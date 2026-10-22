@@ -1,6 +1,6 @@
 # M5 验收记录 — mise-hub M5（收尾）
 
-Date: 2026-10-22 · Branch `feat/m5` (HEAD `952bde3`) · Baseline mise 2026.10.x
+Date: 2026-10-22 · Branch `feat/m5` (HEAD `3712652`, review round 1 applied) · Baseline mise 2026.10.x
 
 M5 范围（用户已确认）：配置/诊断页、打包分发（本地脚本 + GitHub Actions CI）、
 更新检查（版本比对 + 打开下载页，不自动下载安装）、文档、i18n 补全。
@@ -91,7 +91,7 @@ argv，不受影响。）
 | 语言切换 | PASS (inspection) | 共用 `RootView::apply_locale_setting` `app.rs`：切 locale、写设置、落盘，并重新求值启动时烘焙进 InputState 的 placeholder（`tools.search_installed` / `discover.search`），无需重启即生效；locale 列表 `app.rs` `LOCALES` |
 | mise 诊断：可执行文件路径 | PASS (inspection) | `Mise::program()` `crates/mise-core/src/mise.rs:50-53`；报告里带 `program` `crates/mise-core/src/diagnostics.rs:33-40`；UI 展示 `views/settings.rs` `settings.mise_path` |
 | mise 诊断：版本 | PASS (inspection) | `Mise::version()`（`mise --version` 首段）`crates/mise-core/src/mise.rs:35-43`；失败时 `version: None`，探测仍继续（测试 `diagnostics::tests::version_failure_keeps_probes_running_with_none_version`） |
-| mise 诊断：JSON 能力探测 | PASS (inspection) | 7 个只读全局探测 `diagnostics.rs` `PROBES`（registry / ls / config ls / env --json-extended / tasks ls / outdated / ls-remote）；`Mise::diagnostics()` `crates/mise-core/src/mise.rs:55-88` 每个探测**只跑一次**进程；argv 顺序断言 `diagnostics::tests::every_probe_runs_globally_without_dash_c_and_in_order`（含「无 `-C`」断言）；单点失败不影响其余探测 `a_failing_probe_carries_the_raw_error_and_others_still_run`；失败保留 mise 原始 stderr |
+| mise 诊断：JSON 能力探测 | PASS (inspection) | 7 个只读全局探测 `diagnostics.rs` `PROBES`（registry / ls / config ls / env --json-extended / tasks ls / outdated / ls-remote）；`Mise::diagnostics()` `crates/mise-core/src/mise.rs` 每个探测**只跑一次**进程；argv 顺序断言 `diagnostics::tests::every_probe_runs_globally_without_dash_c_and_in_order`（含「无 `-C`」断言）；**探测在显式的中立工作目录里运行**（home 目录，`probe_cwd()`），不继承 App 进程的 cwd——否则 GUI 从哪个目录启动就会影响结果（review round 1 的 B1，回归测试 `every_probe_runs_in_a_neutral_working_directory`；真实 mise 复现：坏配置目录下 `mise env --json-extended` exit 1，home 目录下 exit 0）；单点失败不影响其余探测 `a_failing_probe_carries_the_raw_error_and_others_still_run`；失败保留 mise 原始 stderr |
 | 探测失败展示原始错误 | PASS (inspection) | `Probe.detail` 保存 `CoreError` 原文（`diagnostics.rs:22-31`），UI 直接渲染 `views/settings.rs` `probe_row` 的 detail 行（rule 9） |
 | 诊断不阻塞 UI 线程 | PASS (inspection) | `RootView::rerun_diagnostics` `app.rs`：`std::thread::spawn` + `async_channel` + `cx.spawn` 回主线程（与既有 `load_outdated_for_selection` 同款桥接）；`diagnostics_in_flight` 防重入 |
 | 应用信息（版本 / 路径） | PASS (inspection) | `mise_core::version()`、`settings_path`、`state.store_path` 经 `SettingsSnapshot` 传入 `views/settings.rs` `app_info_section`；快照在渲染前取好，渲染期不再读实体（gpui 二次 `read` 会 panic，见 `app.rs` `env_pane` 注释） |
@@ -102,12 +102,12 @@ argv，不受影响。）
 | 更新：打开下载页 | PASS (inspection) | `crates/mise-hub/src/opener.rs`：`is_openable_url` 只放行 http/https 且拒绝空白字符（`file:` / `javascript:` / 路径全部拒绝）；URL 作为**单个 argv 参数**传递，不走 shell 字符串（`opener_passes_the_url_verbatim_as_its_own_argument`）；macOS `open` / Windows `cmd /C start "" <url>` / 其他 `xdg-open` |
 | 更新：不自动下载安装 | PASS (inspection) | 界面只有「打开下载页」按钮，代码里没有任何下载/替换自身逻辑（`update.rs` 只有 GET 清单） |
 | i18n 补全 | PASS (inspection) | 全量扫描 `crates/mise-hub/src`：**无用户可见的硬编码字符串**（唯一的中文常量是语言名 `中文` 本身）；终端标签页标题改走 `t!`（install / use / uninstall / set / unset / run / watch / upgrade / 备份行），规格与 flag 原样保留；删除 M1 遗留无引用键 `nav.not_available` |
-| locale 键集一致 | PASS (inspection) | 新测试 `i18n::tests::locale_files_have_identical_key_sets` 比较两份 yml 的**嵌套**键路径集合（204 键，含 `settings.probe.*`）；反向验证：临时删掉 zh 的 `settings:` 段后该测试 FAILED，恢复后 PASS（测试有牙齿，非空断言） |
+| locale 键集一致 | PASS (inspection) | 新测试 `i18n::tests::locale_files_have_identical_key_sets` 比较两份 yml 的**嵌套**键路径集合（249 键：12 个顶层 + 237 个嵌套，含 `settings.probe.*`）；反向验证：临时删掉 zh 的 `settings:` 段后该测试 FAILED，恢复后 PASS（测试有牙齿，非空断言） |
 | 打包：macOS .app | PASS (inspection + 实跑) | `scripts/package-macos.sh`：版本从根 `Cargo.toml` 的 `[workspace.package]` 读出写入 Info.plist（`CFBundleShortVersionString`/`CFBundleVersion`）；目录结构 `Contents/{MacOS,Resources}` + Info.plist；`plutil -lint` 通过；二进制实启动不崩溃 |
 | 打包：未签名说明 | PASS (inspection) | 脚本头注释与 README 明确「未签名未公证」，并给出 Gatekeeper 右键打开 / `xattr -dr com.apple.quarantine` 的绕过说明（不假装已公证） |
 | 打包：Windows / Linux | PARTIAL | CI 里用 `cargo build --release --target …` 产出二进制并打包（zip / tar.gz）。**本机无法验证**（无 Windows/Linux 环境）——CI 首次实际运行前只能标注 UNVERIFIED |
-| CI：push tag 出 Release | UNVERIFIED (needs a repo) | `.github/workflows/release.yml`：tag `v*` 触发，matrix 出 macos-arm64 / windows-x64 / linux-x64 三个产物，`softprops/action-gh-release` 发布。仓库目前**没有 git remote**，因此 workflow 未在 GitHub 上跑过；Linux job `continue-on-error`（`matrix.experimental`）确保 Linux 失败不阻塞 macOS/Windows 发布 |
-| CI：日常检查 | UNVERIFIED (needs a repo) | `.github/workflows/ci.yml`：fmt / clippy `-D warnings` / test。同一原因未在 GitHub 上运行过；本地等价命令全部通过（见上） |
+| CI：push tag 出 Release | UNVERIFIED (needs a repo) | `.github/workflows/release.yml`：tag `v*` 触发，matrix 出 macos-arm64 / windows-x64 / linux-x64 三个产物，`softprops/action-gh-release` 发布。仓库目前**没有 git remote**，因此 workflow 未在 GitHub 上跑过；Linux job `continue-on-error`（`matrix.experimental`）确保 Linux 失败不阻塞 macOS/Windows 发布；Windows 打包用 `pwsh` + `Compress-Archive`（runner 镜像里没有 Info-ZIP `zip`），发布门禁用 `if: !cancelled()`，单个平台失败不会吞掉其他平台的产物（review round 1 的 B2） |
+| CI：日常检查 | UNVERIFIED (needs a repo) | `.github/workflows/ci.yml`：先装 GPUI 在 Linux 上要链接的系统库（`libxkbcommon-dev` 等，与 release.yml 同一份 apt 步骤），再跑 fmt / clippy `-D warnings` / test（review round 1 的 B3）。同一原因未在 GitHub 上运行过；本地等价命令全部通过（见上） |
 | 文档 | PASS (inspection) | `README.md`：功能表、构建运行、macOS 打包与 Gatekeeper 说明、CI 发布流程、更新清单 JSON 格式与「无 URL 即禁用」说明、三平台支持表、项目结构。`docs/superpowers/plans/2026-10-22-mise-hub-m5.md` 为本里程碑计划 |
 | GUI 整体行为（设置页渲染与交互、探测徽标、更新检查三态、打开下载页、主题/语言切换即时生效） | UNVERIFIED (GUI-only) | 人工命令：`cargo run -p mise-hub`（或 `dist/mise-hub.app`）。建议步骤：① 侧边栏点「设置」；② 看诊断区是否逐条列出 7 项探测的 OK/FAIL（`ls-remote` 应带「联网」标记）；③ 「重新探测」应显示探测中→结果，且不卡界面；④ 填入一个清单 URL（如本地 `python3 -m http.server` 下的 `{"version":"99.0.0","page_url":"https://example.com"}`）→ 「检查更新」应显示新版本并出现「打开下载页」；⑤ 留空 URL 时按钮应禁用并给出说明；⑥ 切换语言/主题应即时生效且重启后保持 |
 
@@ -121,4 +121,9 @@ argv，不受影响。）
 
 ## Review Gate
 
-见 `.superpowers/sdd/m5/review-report.md`（独立 reviewer，只读，评审范围 `db62d23..HEAD`）。
+- Round 1：独立 reviewer（只读）审 `db62d23..952bde3` → **BLOCKED**：3 个 blocker
+  （探测继承 App cwd 导致误报 FAIL / Windows 打包步骤在 runner 上根本跑不了且会
+  连累整个发布 / ci.yml 缺 Linux 链接依赖）+ 9 个 minor。报告见
+  `.superpowers/sdd/m5/review-report.md`。
+- Round 1 修复：commit `3712652`（3 blocker 全修，m1–m7 全部顺手修掉）。
+- Round 2：复审 `db62d23..3712652`，见 `.superpowers/sdd/m5/review-round2-report.md`。
