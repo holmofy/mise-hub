@@ -216,6 +216,7 @@ fn project_item(
     project: &Project,
     selection: &Selection,
     theme: &Theme,
+    last: bool,
 ) -> impl IntoElement {
     let id = project.id.clone();
     let name = project.name.clone();
