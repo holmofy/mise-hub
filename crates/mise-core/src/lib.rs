@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod diagnostics;
 pub mod env;
 pub mod error;
 pub mod install;
@@ -15,8 +16,10 @@ pub mod settings;
 pub mod tasks;
 pub mod tools;
 pub mod types;
+pub mod update;
 
 pub use backup::{backup_file, default_backup_dir, global_config_path};
+pub use diagnostics::{DiagnosticsReport, Probe};
 pub use env::{
     EnvDeclaration, EnvVar, is_declared, is_redacted, parse_env_extended, parse_set_list,
     path_segments,
@@ -36,6 +39,9 @@ pub use settings::{AppSettings, default_settings_path};
 pub use tasks::{Task, TaskGraph, build_graph, dependency_order, parse_tasks};
 pub use tools::{InstalledSet, Scope, ScopeFilter, ToolRow, filter_rows};
 pub use types::{ConfigSource, InstalledTool, RemoteVersion, ToolEntry};
+pub use update::{
+    UpdateCheck, UpdateManifest, check_update, fetch_manifest, is_newer, parse_manifest,
+};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

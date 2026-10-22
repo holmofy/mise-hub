@@ -15,6 +15,11 @@ pub struct AppSettings {
     pub theme: String,
     /// The selected locale, e.g. `"en"` or `"zh-CN"`.
     pub locale: String,
+    /// URL of the update-check manifest (see `mise_core::update`). Empty
+    /// (the default, also what pre-M5 settings files deserialize to) means
+    /// update checking is disabled.
+    #[serde(default)]
+    pub update_manifest_url: String,
 }
 
 impl Default for AppSettings {
@@ -22,6 +27,7 @@ impl Default for AppSettings {
         Self {
             theme: "Default Light".into(),
             locale: "en".into(),
+            update_manifest_url: String::new(),
         }
     }
 }
@@ -64,6 +70,20 @@ mod tests {
         let s = AppSettings::load(&dir.path().join("settings.json")).unwrap();
         assert_eq!(s.theme, "Default Light");
         assert_eq!(s.locale, "en");
+        assert_eq!(s.update_manifest_url, "");
+    }
+
+    #[test]
+    fn pre_m5_file_without_update_url_deserializes_to_disabled() {
+        // Settings written before M5 lack the field; loading one must not
+        // error and must leave update checking disabled, not invent a URL.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"theme": "Default Dark", "locale": "zh-CN"}"#).unwrap();
+        let s = AppSettings::load(&path).unwrap();
+        assert_eq!(s.theme, "Default Dark");
+        assert_eq!(s.locale, "zh-CN");
+        assert_eq!(s.update_manifest_url, "");
     }
 
     #[test]
@@ -73,6 +93,7 @@ mod tests {
         let s = AppSettings {
             theme: "Default Dark".into(),
             locale: "zh-CN".into(),
+            update_manifest_url: "https://example.com/manifest.json".into(),
         };
         s.save(&path).unwrap();
         assert_eq!(AppSettings::load(&path).unwrap(), s);

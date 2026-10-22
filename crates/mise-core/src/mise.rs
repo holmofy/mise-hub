@@ -1,3 +1,4 @@
+use crate::diagnostics::{DiagnosticsReport, PROBES, Probe};
 use crate::env::{EnvDeclaration, EnvVar, parse_env_extended, parse_set_list};
 use crate::error::CoreError;
 use crate::manage::{UsePreview, parse_use_dry_run};
@@ -40,6 +41,41 @@ impl Mise {
             .next()
             .unwrap_or_default()
             .to_string())
+    }
+
+    /// The resolved path of the `mise` executable this instance calls.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Probe every command in [`PROBES`] and collect a report. Slow (it
+    /// spawns up to eight processes, one of them network-bound) — callers
+    /// must run it on a background thread. Never panics: every failure
+    /// becomes `Probe.detail` with the original message.
+    pub fn diagnostics(&self) -> DiagnosticsReport {
+        let version = self.version().ok();
+        let probes = PROBES
+            .iter()
+            .map(|&(name, args, network)| match self.run(args, None) {
+                Ok(_) => Probe {
+                    name,
+                    ok: true,
+                    network,
+                    detail: None,
+                },
+                Err(e) => Probe {
+                    name,
+                    ok: false,
+                    network,
+                    detail: Some(e.to_string()),
+                },
+            })
+            .collect();
+        DiagnosticsReport {
+            program: self.program.clone(),
+            version,
+            probes,
+        }
     }
 
     pub fn registry(&self) -> Result<Vec<ToolEntry>, CoreError> {
