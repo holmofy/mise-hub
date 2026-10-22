@@ -235,7 +235,9 @@ fn project_item(
         .when(selected, |d| d.bg(theme.muted))
         // Hairline separator between project rows; the last row skips it so
         // no dangling line hangs in the empty space below the list.
-        .when(!last, |d| d.border_b_1().border_color(theme.border.opacity(0.6)))
+        .when(!last, |d| {
+            d.border_b_1().border_color(theme.border.opacity(0.6))
+        })
         .child(
             div()
                 .id(format!("project-row-{}", id))
