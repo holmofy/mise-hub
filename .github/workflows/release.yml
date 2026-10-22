@@ -1,0 +1,120 @@
+name: Release
+
+# Tag a release with `v<version>` (e.g. `v0.1.0`) to build and publish the
+# three platform artifacts as a GitHub Release. The update manifest that
+# mise-hub's settings page reads must point at the same release page.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    # The Linux artifact is best-effort: a broken Linux toolchain must not
+    # block the macOS and Windows releases.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: mise-hub-macos-arm64
+            experimental: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: mise-hub-windows-x64
+            experimental: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: mise-hub-linux-x64
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # GPUI needs the X11 / Wayland / fontconfig development headers on
+      # Linux. Best-effort: the Linux artifact is a convenience, a broken
+      # Linux toolchain must not block the macOS and Windows releases.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcb1-dev \
+            libwayland-dev libfontconfig1-dev libssl-dev pkg-config
+
+      - name: Build
+        run: cargo build --release -p mise-hub --target ${{ matrix.target }}
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: bash scripts/package-macos.sh --no-build --target ${{ matrix.target }}
+
+      - name: Collect macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -r "${{ matrix.artifact }}.zip" mise-hub.app
+          cd ..
+          mv "dist/${{ matrix.artifact }}.zip" .
+
+      - name: Collect Windows binary
+        if: runner.os == 'Windows'
+        # The Windows image has no Info-ZIP `zip`; PowerShell's
+        # Compress-Archive ships with the image, so the step stays
+        # dependency-free. `shell: pwsh` is also the default here — the
+        # POSIX commands below would not run under it.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.artifact }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mise-hub.exe" "dist/${{ matrix.artifact }}/"
+          Compress-Archive -Path "dist/${{ matrix.artifact }}" -DestinationPath "${{ matrix.artifact }}.zip"
+          Remove-Item -Recurse -Force dist
+
+      - name: Collect Linux binary
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/${{ matrix.artifact }}
+          cp "target/${{ matrix.target }}/release/mise-hub" "dist/${{ matrix.artifact }}/"
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist "${{ matrix.artifact }}"
+          rm -rf dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.tar.gz
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Publish whatever legs succeeded — one broken platform must not
+    # swallow the artifacts of the others.
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          # Never create an empty release: if every build leg failed, the
+          # publish must fail loudly instead of shipping nothing.
+          fail_on_unmatched_files: true
+          generate_release_notes: true

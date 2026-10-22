@@ -1,3 +1,4 @@
+use crate::diagnostics::{DiagnosticsReport, PROBE_TIMEOUT, PROBES, Probe, probe_cwd};
 use crate::env::{EnvDeclaration, EnvVar, parse_env_extended, parse_set_list};
 use crate::error::CoreError;
 use crate::manage::{UsePreview, parse_use_dry_run};
@@ -19,6 +20,16 @@ pub struct Mise {
     streamer: Arc<dyn StreamingRunner>,
 }
 
+/// The first whitespace-separated token of `mise --version`'s output —
+/// e.g. `"2026.10.15"` from `"2026.10.15 macos-arm64 (sha)"`.
+fn parse_version(stdout: &str) -> String {
+    stdout
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 impl Mise {
     pub fn new(
         program: PathBuf,
@@ -32,14 +43,106 @@ impl Mise {
         }
     }
 
+    /// The version reported by `mise --version`.
+    ///
+    /// Runs in the neutral probe directory like the capability probes, so
+    /// the app's own version display never depends on the directory the
+    /// GUI was started from (a deleted working directory would otherwise
+    /// make the child process fail to spawn at all).
     pub fn version(&self) -> Result<String, CoreError> {
-        let out = self.run(&["--version"], None)?;
-        Ok(out
-            .stdout
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_string())
+        let cwd = probe_cwd();
+        let out = self.run_in(&["--version"], None, Some(&cwd))?;
+        Ok(parse_version(&out.stdout))
+    }
+
+    /// The resolved path of the `mise` executable this instance calls.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Probe every command in [`PROBES`] and collect a report. Slow (it
+    /// spawns up to eight processes, one of them network-bound) — callers
+    /// must run it on a background thread. Never panics: every failure
+    /// becomes `Probe.detail` with the original message.
+    ///
+    /// Every probe runs with an explicit neutral working directory
+    /// ([`probe_cwd`]) instead of inheriting the app's cwd: mise resolves
+    /// its config by walking up from the cwd, so probing from wherever
+    /// the GUI was started could turn healthy capabilities red because of
+    /// an unrelated project config (and could demand trusting it).
+    pub fn diagnostics(&self) -> DiagnosticsReport {
+        self.diagnostics_with_timeout(PROBE_TIMEOUT)
+    }
+
+    /// [`Mise::diagnostics`] with an explicit per-probe timeout. A probe
+    /// that outlives it is reported as failed ("timed out after Ns")
+    /// instead of blocking the whole report — the network probe is the
+    /// one that can hang.
+    pub fn diagnostics_with_timeout(&self, timeout: std::time::Duration) -> DiagnosticsReport {
+        let cwd = probe_cwd();
+        let version = self
+            .run_probe(&["--version"], Some(&cwd), timeout)
+            .ok()
+            .map(|out| parse_version(&out.stdout));
+        let probes = PROBES
+            .iter()
+            .map(
+                |&(name, args, network)| match self.run_probe(args, Some(&cwd), timeout) {
+                    Ok(_) => Probe {
+                        name,
+                        ok: true,
+                        network,
+                        detail: None,
+                    },
+                    Err(e) => Probe {
+                        name,
+                        ok: false,
+                        network,
+                        detail: Some(e.to_string()),
+                    },
+                },
+            )
+            .collect();
+        DiagnosticsReport {
+            program: self.program.clone(),
+            version,
+            probes,
+        }
+    }
+
+    /// Run one command with a hard time bound. The command runs on a
+    /// helper thread so a hanging child cannot block the caller; the
+    /// helper may outlive the timeout (the child process is not killed),
+    /// but its result is then discarded.
+    fn run_probe(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+        timeout: std::time::Duration,
+    ) -> Result<CommandOutput, CoreError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let program = self.program.clone();
+        let runner = self.runner.clone();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let cwd = cwd.map(|dir| dir.to_path_buf());
+        std::thread::spawn(move || {
+            let result = runner.run(&CommandRequest { program, args, cwd });
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(timeout) {
+            // A non-zero exit is a failure, exactly as in `Mise::run`:
+            // the probe records the RAW stderr, not a "success".
+            Ok(Ok(out)) if out.code != 0 => Err(CoreError::CommandFailed {
+                code: out.code,
+                stderr: out.stderr,
+            }),
+            Ok(Ok(out)) => Ok(out),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(CoreError::Other(format!(
+                "timed out after {}s",
+                timeout.as_secs()
+            ))),
+        }
     }
 
     pub fn registry(&self) -> Result<Vec<ToolEntry>, CoreError> {
@@ -381,12 +484,25 @@ impl Mise {
     }
 
     fn run(&self, args: &[&str], project_root: Option<&Path>) -> Result<CommandOutput, CoreError> {
+        self.run_in(args, project_root, None)
+    }
+
+    /// Like [`Mise::run`], but with an explicit working directory for the
+    /// child process. `cwd: None` means "inherit the app's cwd", which
+    /// makes the result depend on where the GUI was started — the
+    /// diagnostics probes therefore always pass a neutral directory.
+    fn run_in(
+        &self,
+        args: &[&str],
+        project_root: Option<&Path>,
+        cwd: Option<&Path>,
+    ) -> Result<CommandOutput, CoreError> {
         let mut full = self.base_args(project_root);
         full.extend(args.iter().map(|s| s.to_string()));
         let out = self.runner.run(&CommandRequest {
             program: self.program.clone(),
             args: full,
-            cwd: None,
+            cwd: cwd.map(|dir| dir.to_path_buf()),
         })?;
         if out.code != 0 {
             return Err(CoreError::CommandFailed {

@@ -1,5 +1,6 @@
 pub mod discover;
 pub mod env;
+pub mod settings;
 pub mod setup;
 pub mod sidebar;
 pub mod tasks;

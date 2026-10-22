@@ -4,6 +4,7 @@ use mise_core::{
     filter_rows,
 };
 use mise_core::{RemoteVersion, SearchHit, SearchIndex, StreamEvent, types::ToolInfo};
+use rust_i18n::t;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +16,9 @@ pub enum Selection {
     GlobalTools,
     GlobalTasks,
     GlobalEnv,
+    /// Settings / diagnostics page (M5): appearance, mise capability
+    /// probes, app info and the update check.
+    Settings,
     ProjectTools(String),
     // Milestone scaffolding: Tasks is wired up in M4, Environment in M3.
     #[allow(dead_code)] // M4 scaffolding
@@ -183,6 +187,19 @@ pub struct AppState {
     /// must point this at a tempdir so the developer's real
     /// `~/.config/mise/config.toml` is never read or copied there.
     pub backup_dir: PathBuf,
+    /// Snapshot of the settings-page capability probes (M5-T2), filled on a
+    /// background thread by `RootView::rerun_diagnostics`; a mise-level
+    /// failure cannot occur (every probe failure is data), so `Failed`
+    /// holds thread-level errors only.
+    pub diagnostics: Loadable<mise_core::DiagnosticsReport>,
+    /// True while a diagnostics probe is running: the settings page offers
+    /// 「重新探测」 only when idle, so double clicks cannot stack probes.
+    pub diagnostics_in_flight: bool,
+    /// Result of the last update check (M5-T2). `Ready` persists until the
+    /// user checks again; `Failed` keeps the raw transport error (rule 9).
+    pub update: Loadable<mise_core::UpdateCheck>,
+    /// True while an update check is in flight (double-click guard).
+    pub update_in_flight: bool,
 }
 
 impl AppState {
@@ -223,6 +240,10 @@ impl AppState {
             task_watch_sessions: std::collections::HashMap::new(),
             last_backup: None,
             backup_dir: mise_core::default_backup_dir(),
+            diagnostics: Loadable::Idle,
+            diagnostics_in_flight: false,
+            update: Loadable::Idle,
+            update_in_flight: false,
         }
     }
 
@@ -424,8 +445,8 @@ impl AppState {
         let root = self.current_project_root();
         let global = root.is_none();
         let title = match spec {
-            Some(spec) => format!("upgrade {spec}"),
-            None => "upgrade".to_string(),
+            Some(spec) => t!("terminal.upgrade", spec = spec).to_string(),
+            None => t!("terminal.upgrade_all").to_string(),
         };
         let rx = mise.upgrade_stream(spec, bump, global, root.as_deref())?;
         let session = self.terminal.begin(title);
@@ -443,7 +464,9 @@ impl AppState {
         };
         let root = self.current_project_root();
         let rx = mise.install_stream(tool, version, root.as_deref())?;
-        let session = self.terminal.begin(format!("install {tool}@{version}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.install", spec = format!("{tool}@{version}")).to_string());
         Ok((session, rx))
     }
 
@@ -492,12 +515,19 @@ impl AppState {
                 return Err(e);
             }
         };
+        // The scope marker is a CLI FLAG shown verbatim (like `--bump` on
+        // the upgrade page), not prose — it is deliberately not part of
+        // the translated title.
         let scope = if global { " (--global)" } else { "" };
-        let session = self.terminal.begin(format!("use {spec}{scope}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.use", spec = format!("{spec}{scope}")).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -520,7 +550,9 @@ impl AppState {
         let spec = uninstall_spec(tool, version);
         let root = self.current_project_root();
         let rx = mise.uninstall_stream(&spec, root.as_deref())?;
-        let session = self.terminal.begin(format!("uninstall {spec}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.uninstall", spec = spec).to_string());
         Ok((session, rx))
     }
 
@@ -580,11 +612,15 @@ impl AppState {
                 .ok_or(mise_core::CoreError::NotFound)?,
         )?;
         let rx = mise.set_env_stream(name, value, global, root.as_deref())?;
-        let session = self.terminal.begin(format!("set {name}={value}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.set", spec = format!("{name}={value}")).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -616,11 +652,15 @@ impl AppState {
                 .ok_or(mise_core::CoreError::NotFound)?,
         )?;
         let rx = mise.unset_env_stream(name, global, root.as_deref())?;
-        let session = self.terminal.begin(format!("unset {name}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.unset", spec = name).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -644,11 +684,15 @@ impl AppState {
         let root = self.current_project_root();
         self.backup_before_write(file)?;
         let rx = mise.set_env_file_stream(name, value, file, root.as_deref())?;
-        let session = self.terminal.begin(format!("set {name}={value}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.set", spec = format!("{name}={value}")).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -671,11 +715,15 @@ impl AppState {
         let root = self.current_project_root();
         self.backup_before_write(file)?;
         let rx = mise.unset_env_file_stream(name, file, root.as_deref())?;
-        let session = self.terminal.begin(format!("unset {name}"));
+        let session = self
+            .terminal
+            .begin(t!("terminal.unset", spec = name).to_string());
         if let Some(b) = self.last_backup.clone() {
             self.terminal.push_event_to(
                 session,
-                StreamEvent::Stdout(format!("backup: {}", b.display())),
+                StreamEvent::Stdout(
+                    t!("terminal.backup", path = b.display().to_string()).to_string(),
+                ),
             );
         }
         Ok((session, rx))
@@ -728,8 +776,12 @@ impl AppState {
         } else {
             mise.run_task_stream(task, root.as_deref())?
         };
-        let verb = if watch { "watch" } else { "run" };
-        let session = self.terminal.begin(format!("{verb} {task}"));
+        let title = if watch {
+            t!("terminal.watch", spec = task).to_string()
+        } else {
+            t!("terminal.run", spec = task).to_string()
+        };
+        let session = self.terminal.begin(title);
         if watch {
             self.task_watch_sessions.insert(task.to_string(), session);
         }
@@ -874,6 +926,13 @@ impl AppState {
     /// runs `mise search --all`) only runs for a non-empty query.
     pub fn deep_search_query_runs(query: &str) -> bool {
         !query.trim().is_empty()
+    }
+
+    /// Pure gate for the update-check button (M5-T2): with no manifest URL
+    /// configured the check is disabled — the button says why instead of
+    /// firing a network error at an empty URL.
+    pub fn update_check_enabled(url: &str) -> bool {
+        !url.trim().is_empty()
     }
 
     /// Search or browse the loaded registry. An empty query returns every
@@ -1960,7 +2019,9 @@ mod upgrade_tests {
                 "--global".to_string(),
             ]
         );
-        assert_eq!(state.terminal.sessions[session].title, "upgrade");
+        // The tab title names the ACTION for the user ("upgrade all");
+        // the argv above is what mise actually receives.
+        assert_eq!(state.terminal.sessions[session].title, "upgrade all");
     }
 
     #[test]
@@ -2993,5 +3054,24 @@ mod env_write_tests {
         assert!(seen.lock().unwrap().is_empty(), "no write started");
         assert!(state.terminal.sessions.is_empty());
         assert!(state.last_backup.is_none());
+    }
+}
+
+#[cfg(test)]
+mod settings_page_tests {
+    use super::AppState;
+
+    /// The update-check button is gated on a NON-BLANK manifest URL: with no
+    /// release channel configured the check is disabled rather than firing
+    /// a request at an empty URL (M5-T2).
+    #[test]
+    fn update_check_requires_a_non_blank_url() {
+        assert!(!AppState::update_check_enabled(""));
+        assert!(!AppState::update_check_enabled("   "));
+        assert!(AppState::update_check_enabled(
+            "https://example.com/manifest.json"
+        ));
+        // Surrounding whitespace from an input field must not disable it.
+        assert!(AppState::update_check_enabled(" https://x "));
     }
 }

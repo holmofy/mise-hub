@@ -1,3 +1,6 @@
 /target
 .superpowers/
 .DS_Store
+
+# packaging output
+/dist
