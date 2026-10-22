@@ -52,6 +52,20 @@ pub const PROBES: &[(&str, &[&str], bool)] = &[
     ("ls-remote", &["ls-remote", "node", "--json"], true),
 ];
 
+/// A neutral working directory for the probes: the user's home directory,
+/// where mise's GLOBAL config lives and where no project config is
+/// expected. Without an explicit cwd the child would inherit the app
+/// process's cwd, and mise resolves its config by walking up from there —
+/// an unrelated project config (or an untrusted one) would then turn
+/// healthy capabilities red. Falls back to the temp directory when no
+/// home directory can be resolved.
+pub fn probe_cwd() -> Option<PathBuf> {
+    match directories::UserDirs::new() {
+        Some(dirs) => Some(dirs.home_dir().to_path_buf()),
+        None => Some(std::env::temp_dir()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,16 +77,17 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    /// A runner that records every argv and fails exactly the commands
-    /// whose joined args are listed in `fail`, echoing a marker on stderr.
+    /// A runner that records every request (argv AND working directory)
+    /// and fails exactly the commands whose joined args are listed in
+    /// `fail`, echoing a marker on stderr.
     struct FakeRunner {
-        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        seen: Arc<Mutex<Vec<CommandRequest>>>,
         fail: Vec<String>,
     }
 
     impl CommandRunner for FakeRunner {
         fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
-            self.seen.lock().unwrap().push(req.args.clone());
+            self.seen.lock().unwrap().push(req.clone());
             let joined = req.args.join(" ");
             if self.fail.contains(&joined) {
                 return Ok(CommandOutput {
@@ -99,7 +114,7 @@ mod tests {
         }
     }
 
-    fn mise_with(fail: Vec<String>) -> (Mise, Arc<Mutex<Vec<Vec<String>>>>) {
+    fn mise_with(fail: Vec<String>) -> (Mise, Arc<Mutex<Vec<CommandRequest>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mise = Mise::new(
             PathBuf::from("/usr/local/bin/mise"),
@@ -133,18 +148,35 @@ mod tests {
                 .iter()
                 .map(|(_, args, _)| args.iter().map(|s| s.to_string()).collect()),
         );
-        assert_eq!(*seen.lock().unwrap(), expected);
+        let seen = seen.lock().unwrap();
+        let actual: Vec<Vec<String>> = seen.iter().map(|req| req.args.clone()).collect();
+        assert_eq!(actual, expected);
 
         assert_eq!(report.probes.len(), PROBES.len());
         assert!(report.probes.iter().all(|p| p.ok && p.detail.is_none()));
         assert!(
-            !seen
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|args| args.contains(&"-C".to_string())),
+            !seen.iter().any(|req| req.args.contains(&"-C".to_string())),
             "diagnostics are global-scope: no -C anywhere"
         );
+    }
+
+    /// Every probe must run with an explicit, neutral working directory.
+    /// Inheriting the app's cwd would make the probe result depend on
+    /// wherever the GUI was started: an unrelated (or untrusted) project
+    /// config there would turn healthy capabilities red.
+    #[test]
+    fn every_probe_runs_in_a_neutral_working_directory() {
+        let (mise, seen) = mise_with(vec![]);
+        mise.diagnostics();
+
+        let expected = probe_cwd();
+        for req in seen.lock().unwrap().iter() {
+            assert_eq!(
+                req.cwd, expected,
+                "probe {:?} must not inherit the app's cwd",
+                req.args
+            );
+        }
     }
 
     #[test]

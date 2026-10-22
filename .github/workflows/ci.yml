@@ -19,6 +19,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
+      # GPUI links against the X11 / Wayland / fontconfig / xkbcommon
+      # system libraries on Linux — without these headers the build (and
+      # therefore clippy and the test binaries) cannot link.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcb1-dev \
+            libwayland-dev libfontconfig1-dev libssl-dev pkg-config
+
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

@@ -1,4 +1,4 @@
-use crate::diagnostics::{DiagnosticsReport, PROBES, Probe};
+use crate::diagnostics::{DiagnosticsReport, PROBES, Probe, probe_cwd};
 use crate::env::{EnvDeclaration, EnvVar, parse_env_extended, parse_set_list};
 use crate::error::CoreError;
 use crate::manage::{UsePreview, parse_use_dry_run};
@@ -20,6 +20,16 @@ pub struct Mise {
     streamer: Arc<dyn StreamingRunner>,
 }
 
+/// The first whitespace-separated token of `mise --version`'s output —
+/// e.g. `"2026.10.15"` from `"2026.10.15 macos-arm64 (sha)"`.
+fn parse_version(stdout: &str) -> String {
+    stdout
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 impl Mise {
     pub fn new(
         program: PathBuf,
@@ -35,12 +45,7 @@ impl Mise {
 
     pub fn version(&self) -> Result<String, CoreError> {
         let out = self.run(&["--version"], None)?;
-        Ok(out
-            .stdout
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_string())
+        Ok(parse_version(&out.stdout))
     }
 
     /// The resolved path of the `mise` executable this instance calls.
@@ -52,24 +57,36 @@ impl Mise {
     /// spawns up to eight processes, one of them network-bound) — callers
     /// must run it on a background thread. Never panics: every failure
     /// becomes `Probe.detail` with the original message.
+    ///
+    /// Every probe runs with an explicit neutral working directory
+    /// ([`probe_cwd`]) instead of inheriting the app's cwd: mise resolves
+    /// its config by walking up from the cwd, so probing from wherever
+    /// the GUI was started could turn healthy capabilities red because of
+    /// an unrelated project config (and could demand trusting it).
     pub fn diagnostics(&self) -> DiagnosticsReport {
-        let version = self.version().ok();
+        let cwd = probe_cwd();
+        let version = self
+            .run_in(&["--version"], None, cwd.as_deref())
+            .ok()
+            .map(|out| parse_version(&out.stdout));
         let probes = PROBES
             .iter()
-            .map(|&(name, args, network)| match self.run(args, None) {
-                Ok(_) => Probe {
-                    name,
-                    ok: true,
-                    network,
-                    detail: None,
+            .map(
+                |&(name, args, network)| match self.run_in(args, None, cwd.as_deref()) {
+                    Ok(_) => Probe {
+                        name,
+                        ok: true,
+                        network,
+                        detail: None,
+                    },
+                    Err(e) => Probe {
+                        name,
+                        ok: false,
+                        network,
+                        detail: Some(e.to_string()),
+                    },
                 },
-                Err(e) => Probe {
-                    name,
-                    ok: false,
-                    network,
-                    detail: Some(e.to_string()),
-                },
-            })
+            )
             .collect();
         DiagnosticsReport {
             program: self.program.clone(),
@@ -417,12 +434,25 @@ impl Mise {
     }
 
     fn run(&self, args: &[&str], project_root: Option<&Path>) -> Result<CommandOutput, CoreError> {
+        self.run_in(args, project_root, None)
+    }
+
+    /// Like [`Mise::run`], but with an explicit working directory for the
+    /// child process. `cwd: None` means "inherit the app's cwd", which
+    /// makes the result depend on where the GUI was started — the
+    /// diagnostics probes therefore always pass a neutral directory.
+    fn run_in(
+        &self,
+        args: &[&str],
+        project_root: Option<&Path>,
+        cwd: Option<&Path>,
+    ) -> Result<CommandOutput, CoreError> {
         let mut full = self.base_args(project_root);
         full.extend(args.iter().map(|s| s.to_string()));
         let out = self.runner.run(&CommandRequest {
             program: self.program.clone(),
             args: full,
-            cwd: None,
+            cwd: cwd.map(|dir| dir.to_path_buf()),
         })?;
         if out.code != 0 {
             return Err(CoreError::CommandFailed {

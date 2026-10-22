@@ -242,7 +242,14 @@ fn diagnostics_section(
         );
 
     let body: gpui::AnyElement = match report {
-        Loadable::Idle | Loadable::Loading => div()
+        // "Not probed yet" and "probing" are different states: the first
+        // one must not read as work in progress.
+        Loadable::Idle => div()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .child(t!("settings.diagnostics_idle").to_string())
+            .into_any_element(),
+        Loadable::Loading => div()
             .text_sm()
             .text_color(theme.muted_foreground)
             .child(t!("settings.diagnostics_running").to_string())

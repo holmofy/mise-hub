@@ -344,6 +344,14 @@ impl RootView {
         tasks_filter_input.update(cx, |input, cx| {
             input.set_placeholder(t!("tasks.filter").to_string(), window, cx)
         });
+        let update_url_input = self.update_url_input.clone();
+        update_url_input.update(cx, |input, cx| {
+            input.set_placeholder(
+                t!("settings.update_url_placeholder").to_string(),
+                window,
+                cx,
+            )
+        });
         cx.notify();
     }
 
@@ -366,14 +374,18 @@ impl RootView {
             tx.send_blocking(mise.diagnostics()).ok();
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(report) = rx.recv().await {
-                this.update(cx, |this, cx| {
-                    this.state.diagnostics_in_flight = false;
+            let result = rx.recv().await;
+            this.update(cx, |this, cx| {
+                // The in-flight flag is cleared in BOTH branches: a worker
+                // thread that panicked (or a dropped sender) must not leave
+                // the 「重新探测」 button disabled for the rest of the session.
+                this.state.diagnostics_in_flight = false;
+                if let Ok(report) = result {
                     this.state.diagnostics = Loadable::Ready(report);
-                    cx.notify();
-                })
-                .ok();
-            }
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -396,17 +408,20 @@ impl RootView {
             tx.send_blocking(result).ok();
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(result) = rx.recv().await {
-                this.update(cx, |this, cx| {
-                    this.state.update_in_flight = false;
+            let result = rx.recv().await;
+            this.update(cx, |this, cx| {
+                // Cleared in both branches — a dead worker must not leave
+                // the check button permanently disabled.
+                this.state.update_in_flight = false;
+                if let Ok(result) = result {
                     this.state.update = match result {
                         Ok(check) => Loadable::Ready(check),
                         Err(e) => Loadable::Failed(e.to_string()),
                     };
-                    cx.notify();
-                })
-                .ok();
-            }
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }

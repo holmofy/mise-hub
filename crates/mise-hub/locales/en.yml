@@ -238,6 +238,7 @@ settings:
   diagnostics: Capability probes
   diagnostics_rerun: Re-probe
   diagnostics_running: Probing…
+  diagnostics_idle: Not probed yet
   diagnostics_failed: Probing failed
   mise_path: Executable
   mise_version: Version

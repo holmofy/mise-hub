@@ -226,6 +226,7 @@ settings:
   diagnostics: 能力探测
   diagnostics_rerun: 重新探测
   diagnostics_running: 探测中…
+  diagnostics_idle: 尚未探测
   diagnostics_failed: 探测失败
   mise_path: 可执行文件
   mise_version: 版本

@@ -73,13 +73,16 @@ jobs:
 
       - name: Collect Windows binary
         if: runner.os == 'Windows'
+        # The Windows image has no Info-ZIP `zip`; PowerShell's
+        # Compress-Archive ships with the image, so the step stays
+        # dependency-free. `shell: pwsh` is also the default here — the
+        # POSIX commands below would not run under it.
+        shell: pwsh
         run: |
-          mkdir -p dist/${{ matrix.artifact }}
-          cp "target/${{ matrix.target }}/release/mise-hub.exe" "dist/${{ matrix.artifact }}/"
-          cd dist
-          zip -r "../${{ matrix.artifact }}.zip" "${{ matrix.artifact }}"
-          cd ..
-          rm -rf dist
+          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.artifact }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mise-hub.exe" "dist/${{ matrix.artifact }}/"
+          Compress-Archive -Path "dist/${{ matrix.artifact }}" -DestinationPath "${{ matrix.artifact }}.zip"
+          Remove-Item -Recurse -Force dist
 
       - name: Collect Linux binary
         if: runner.os == 'Linux'
@@ -100,7 +103,9 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
-    if: success()
+    # Publish whatever legs succeeded — one broken platform must not
+    # swallow the artifacts of the others.
+    if: ${{ !cancelled() }}
     steps:
       - uses: actions/download-artifact@v4
         with:
