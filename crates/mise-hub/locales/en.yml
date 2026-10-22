@@ -2,6 +2,7 @@ app:
   name: mise-hub
 common:
   retry: Retry
+  save: Save
 nav:
   workbench: Workbench
   discover: Discover
@@ -9,6 +10,7 @@ nav:
   tools: Tools
   tasks: Tasks
   env: Environment
+  settings: Settings
   env_project: Project environment
   tasks_project: Project tasks
   projects: Projects
@@ -218,3 +220,41 @@ env:
   path_system: System / inherited
   tool_injected: Injected by tool (%{tool})
   system: System / process environment
+settings:
+  title: Settings
+  appearance: Appearance
+  theme: Theme
+  language: Language
+  mise: mise
+  diagnostics: Capability probes
+  diagnostics_rerun: Re-probe
+  diagnostics_running: Probing…
+  diagnostics_failed: Probing failed
+  mise_path: Executable
+  mise_version: Version
+  mise_version_unknown: could not read (mise --version failed)
+  probe_ok: OK
+  probe_fail: FAIL
+  probe_network: network
+  probe:
+    registry: Tool registry (mise registry --json)
+    ls: Installed tools (mise ls --json)
+    config: Config files (mise config ls --json)
+    env: Environment (mise env --json-extended)
+    tasks: Tasks (mise tasks ls --json)
+    outdated: Outdated tools (mise outdated --json)
+    ls_remote: Remote versions (mise ls-remote node --json)
+  app: Application
+  app_version: App version
+  settings_file: Settings file
+  store_file: Project list
+  update: Update check
+  update_url: Manifest URL
+  update_check: Check for updates
+  update_check_disabled: Set a manifest URL first — with no release channel configured, checking is disabled.
+  update_checking: Checking…
+  update_uptodate: You are on the latest version
+  update_available: Version %{version} is available
+  update_open_page: Open download page
+  update_open_failed: Could not open the browser
+  update_failed: Update check failed

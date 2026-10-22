@@ -70,6 +70,14 @@ pub fn render(
         &theme,
         0,
     ));
+    col = col.child(nav_item(
+        cx,
+        t!("nav.settings").to_string(),
+        Selection::Settings,
+        selection,
+        &theme,
+        0,
+    ));
 
     col = col.child(project_header(cx, collapsed, &theme));
 
@@ -145,6 +153,7 @@ fn selection_id(selection: &Selection) -> String {
     match selection {
         Selection::Discover => "discover".into(),
         Selection::Upgrade => "upgrade".into(),
+        Selection::Settings => "settings".into(),
         Selection::GlobalTools => "global-tools".into(),
         Selection::GlobalTasks => "global-tasks".into(),
         Selection::GlobalEnv => "global-env".into(),

@@ -15,6 +15,9 @@ pub enum Selection {
     GlobalTools,
     GlobalTasks,
     GlobalEnv,
+    /// Settings / diagnostics page (M5): appearance, mise capability
+    /// probes, app info and the update check.
+    Settings,
     ProjectTools(String),
     // Milestone scaffolding: Tasks is wired up in M4, Environment in M3.
     #[allow(dead_code)] // M4 scaffolding
@@ -183,6 +186,19 @@ pub struct AppState {
     /// must point this at a tempdir so the developer's real
     /// `~/.config/mise/config.toml` is never read or copied there.
     pub backup_dir: PathBuf,
+    /// Snapshot of the settings-page capability probes (M5-T2), filled on a
+    /// background thread by `RootView::rerun_diagnostics`; a mise-level
+    /// failure cannot occur (every probe failure is data), so `Failed`
+    /// holds thread-level errors only.
+    pub diagnostics: Loadable<mise_core::DiagnosticsReport>,
+    /// True while a diagnostics probe is running: the settings page offers
+    /// 「重新探测」 only when idle, so double clicks cannot stack probes.
+    pub diagnostics_in_flight: bool,
+    /// Result of the last update check (M5-T2). `Ready` persists until the
+    /// user checks again; `Failed` keeps the raw transport error (rule 9).
+    pub update: Loadable<mise_core::UpdateCheck>,
+    /// True while an update check is in flight (double-click guard).
+    pub update_in_flight: bool,
 }
 
 impl AppState {
@@ -223,6 +239,10 @@ impl AppState {
             task_watch_sessions: std::collections::HashMap::new(),
             last_backup: None,
             backup_dir: mise_core::default_backup_dir(),
+            diagnostics: Loadable::Idle,
+            diagnostics_in_flight: false,
+            update: Loadable::Idle,
+            update_in_flight: false,
         }
     }
 
@@ -874,6 +894,13 @@ impl AppState {
     /// runs `mise search --all`) only runs for a non-empty query.
     pub fn deep_search_query_runs(query: &str) -> bool {
         !query.trim().is_empty()
+    }
+
+    /// Pure gate for the update-check button (M5-T2): with no manifest URL
+    /// configured the check is disabled — the button says why instead of
+    /// firing a network error at an empty URL.
+    pub fn update_check_enabled(url: &str) -> bool {
+        !url.trim().is_empty()
     }
 
     /// Search or browse the loaded registry. An empty query returns every
@@ -2993,5 +3020,24 @@ mod env_write_tests {
         assert!(seen.lock().unwrap().is_empty(), "no write started");
         assert!(state.terminal.sessions.is_empty());
         assert!(state.last_backup.is_none());
+    }
+}
+
+#[cfg(test)]
+mod settings_page_tests {
+    use super::AppState;
+
+    /// The update-check button is gated on a NON-BLANK manifest URL: with no
+    /// release channel configured the check is disabled rather than firing
+    /// a request at an empty URL (M5-T2).
+    #[test]
+    fn update_check_requires_a_non_blank_url() {
+        assert!(!AppState::update_check_enabled(""));
+        assert!(!AppState::update_check_enabled("   "));
+        assert!(AppState::update_check_enabled(
+            "https://example.com/manifest.json"
+        ));
+        // Surrounding whitespace from an input field must not disable it.
+        assert!(AppState::update_check_enabled(" https://x "));
     }
 }

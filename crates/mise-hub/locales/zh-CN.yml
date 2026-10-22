@@ -2,6 +2,7 @@ app:
   name: mise-hub
 common:
   retry: 重试
+  save: 保存
 nav:
   workbench: 工作台
   discover: 发现
@@ -9,6 +10,7 @@ nav:
   tools: 工具
   tasks: 任务
   env: 环境
+  settings: 设置
   env_project: 项目环境
   tasks_project: 项目任务
   projects: 项目
@@ -206,3 +208,41 @@ env:
   path_system: 系统 / 继承
   tool_injected: 由工具注入（%{tool}）
   system: 系统 / 进程环境
+settings:
+  title: 设置
+  appearance: 外观
+  theme: 主题
+  language: 语言
+  mise: mise
+  diagnostics: 能力探测
+  diagnostics_rerun: 重新探测
+  diagnostics_running: 探测中…
+  diagnostics_failed: 探测失败
+  mise_path: 可执行文件
+  mise_version: 版本
+  mise_version_unknown: 无法读取（mise --version 失败）
+  probe_ok: 正常
+  probe_fail: 失败
+  probe_network: 联网
+  probe:
+    registry: 工具索引（mise registry --json）
+    ls: 已安装工具（mise ls --json）
+    config: 配置文件（mise config ls --json）
+    env: 环境变量（mise env --json-extended）
+    tasks: 任务（mise tasks ls --json）
+    outdated: 可升级项（mise outdated --json）
+    ls_remote: 远端版本（mise ls-remote node --json）
+  app: 应用
+  app_version: 应用版本
+  settings_file: 设置文件
+  store_file: 项目清单
+  update: 更新检查
+  update_url: 清单地址
+  update_check: 检查更新
+  update_check_disabled: 请先填写清单地址——未配置发布渠道时无法检查更新。
+  update_checking: 检查中…
+  update_uptodate: 已是最新版本
+  update_available: 有新版本 %{version} 可用
+  update_open_page: 打开下载页
+  update_open_failed: 无法打开浏览器
+  update_failed: 更新检查失败

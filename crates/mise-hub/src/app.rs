@@ -4,7 +4,7 @@ use crate::state::{
 };
 use crate::theme;
 use crate::views::{
-    discover, env, setup, sidebar, tasks, terminal, tool_detail, tool_list, upgrade,
+    discover, env, settings, setup, sidebar, tasks, terminal, tool_detail, tool_list, upgrade,
 };
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
@@ -23,8 +23,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
-/// Locale choices exposed by the language picker: (locale code, display label).
-const LOCALES: [(&str, &str); 2] = [("en", "English"), ("zh-CN", "中文")];
+/// Locale choices exposed by the language pickers (header AND settings
+/// page): (locale code, display label).
+pub(crate) const LOCALES: [(&str, &str); 2] = [("en", "English"), ("zh-CN", "中文")];
 
 pub struct RootView {
     pub state: AppState,
@@ -82,6 +83,14 @@ pub struct RootView {
     _discover_subscription: Subscription,
     /// Keyboard events of the tasks-page filter input must trigger redraws.
     _tasks_filter_subscription: Subscription,
+    /// Settings-page update manifest URL draft (M5-T2). Its value may differ
+    /// from `settings.update_manifest_url` until 「保存」 is clicked; the
+    /// check button operates on the draft so the user always checks exactly
+    /// what is in the box.
+    pub update_url_input: Entity<InputState>,
+    /// Keyboard input in the URL draft must trigger a redraw (the check
+    /// button's enabled state depends on it).
+    _update_url_subscription: Subscription,
 }
 
 /// Local state of the open 「新增 / 编辑变量」 dialog. The input entities are
@@ -164,6 +173,25 @@ impl RootView {
             },
         );
 
+        // Settings page (M5-T2): manifest URL draft, prefilled with the
+        // persisted value so the field never starts blank after a restart.
+        let update_url_input = cx.new(|cx| {
+            let state = InputState::new(window, cx);
+            if settings.update_manifest_url.is_empty() {
+                state
+            } else {
+                state.default_value(settings.update_manifest_url.clone())
+            }
+        });
+        let update_url_subscription = cx.subscribe(
+            &update_url_input,
+            |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        );
+
         let mut this = Self {
             state,
             settings,
@@ -189,6 +217,8 @@ impl RootView {
             _search_subscription: search_subscription,
             _discover_subscription: discover_subscription,
             _tasks_filter_subscription: tasks_filter_subscription,
+            update_url_input,
+            _update_url_subscription: update_url_subscription,
         };
         // Mark the installed list as loading before the (synchronous) refresh
         // so a slow `mise ls` reads as "loading", not as "no tools installed".
@@ -197,7 +227,7 @@ impl RootView {
         this
     }
 
-    fn locale_label(code: &str) -> &'static str {
+    pub(crate) fn locale_label(code: &str) -> &'static str {
         LOCALES
             .iter()
             .find(|(c, _)| *c == code)
@@ -252,6 +282,140 @@ impl RootView {
             self.state.env_exact.clear();
             self.load_env_for_selection(false, cx);
         }
+        // Settings page: probe mise capabilities on the FIRST visit (and
+        // after a manual re-probe reset them); probes run on a background
+        // thread so a slow `ls-remote` never blocks the UI thread.
+        if matches!(self.state.selection, Selection::Settings)
+            && matches!(self.state.diagnostics, Loadable::Idle)
+        {
+            self.rerun_diagnostics(cx);
+        }
+        cx.notify();
+    }
+
+    // -------------------------------------------------------------------
+    // Settings page (M5-T2)
+    // -------------------------------------------------------------------
+
+    /// Apply a theme and persist the choice. Shared by the header picker
+    /// and the settings page so the two entry points cannot drift apart.
+    pub(crate) fn apply_theme_setting(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        theme::apply_theme(&name, window, cx);
+        self.settings.theme = name;
+        let _ = self.settings.save(&self.settings_path);
+        cx.notify();
+    }
+
+    /// Switch the locale and persist the choice. Shared by the header
+    /// picker and the settings page; the search placeholders were baked
+    /// into their InputStates at startup, so they are re-evaluated here to
+    /// follow the switch without a restart.
+    pub(crate) fn apply_locale_setting(
+        &mut self,
+        code: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        i18n::set_locale(code);
+        self.settings.locale = code.to_string();
+        let _ = self.settings.save(&self.settings_path);
+        let search_input = self.search_input.clone();
+        let discover_input = self.discover_input.clone();
+        search_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("tools.search_installed").to_string(), window, cx)
+        });
+        discover_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("discover.search").to_string(), window, cx)
+        });
+        cx.notify();
+    }
+
+    /// Re-run the capability probes on a background thread. Guarded by
+    /// `diagnostics_in_flight` so rapid clicks cannot stack probe runs;
+    /// the result replaces the snapshot unconditionally (probes are not
+    /// scope-dependent, so there is no stale-scope guard here).
+    pub(crate) fn rerun_diagnostics(&mut self, cx: &mut Context<Self>) {
+        if self.state.diagnostics_in_flight {
+            return;
+        }
+        let Some(mise) = self.state.mise.clone() else {
+            return;
+        };
+        self.state.diagnostics_in_flight = true;
+        self.state.diagnostics = Loadable::Loading;
+        cx.notify();
+        let (tx, rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            tx.send_blocking(mise.diagnostics()).ok();
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(report) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    this.state.diagnostics_in_flight = false;
+                    this.state.diagnostics = Loadable::Ready(report);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Check the manifest at `url` on a background thread (the fetch
+    /// blocks; the UI thread never does). The result compares against this
+    /// app's own version — mise-hub only ever TELLS the user about a new
+    /// release, it never downloads or replaces itself.
+    pub(crate) fn check_for_updates(&mut self, url: String, cx: &mut Context<Self>) {
+        if !AppState::update_check_enabled(&url) || self.state.update_in_flight {
+            return;
+        }
+        self.state.update_in_flight = true;
+        self.state.update = Loadable::Loading;
+        cx.notify();
+        let (tx, rx) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            let result = mise_core::fetch_manifest(&url, std::time::Duration::from_secs(10))
+                .and_then(|body| mise_core::check_update(|| Ok(body), mise_core::version()));
+            tx.send_blocking(result).ok();
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                this.update(cx, |this, cx| {
+                    this.state.update_in_flight = false;
+                    this.state.update = match result {
+                        Ok(check) => Loadable::Ready(check),
+                        Err(e) => Loadable::Failed(e.to_string()),
+                    };
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Persist the URL draft from the settings-page input into
+    /// `AppSettings`. Writes only the app's own settings file — never a
+    /// mise config (AGENTS.md rule 3 concerns mise files only).
+    pub(crate) fn save_update_url(&mut self, cx: &mut Context<Self>) {
+        let url = self.update_url_input.read(cx).value().trim().to_string();
+        self.settings.update_manifest_url = url;
+        let _ = self.settings.save(&self.settings_path);
+        cx.notify();
+    }
+
+    /// Hand the release page to the platform browser. Only http(s) URLs
+    /// ever reach the OS opener (`opener::open_url` refuses the rest); a
+    /// failure surfaces as the root notice with the raw error (rule 9).
+    pub(crate) fn open_update_page(&mut self, url: String, cx: &mut Context<Self>) {
+        self.notice = crate::opener::open_url(&url)
+            .err()
+            .map(|e| format!("{}: {e}", t!("settings.update_open_failed")));
         cx.notify();
     }
 
@@ -1747,6 +1911,25 @@ impl RootView {
         upgrade::render(cx, &self.state.outdated, self.upgrade_bump)
     }
 
+    /// Settings page (M5-T2): snapshot everything the builder needs up
+    /// front — the view builders must never `cx.entity().read(cx)`
+    /// mid-render (the entity is leased out then; a second read panics).
+    fn settings_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = settings::SettingsSnapshot {
+            theme_names: theme::theme_names(cx),
+            current_theme: self.settings.theme.clone(),
+            current_locale: self.settings.locale.clone(),
+            diagnostics: self.state.diagnostics.clone(),
+            diagnostics_in_flight: self.state.diagnostics_in_flight,
+            update: self.state.update.clone(),
+            update_in_flight: self.state.update_in_flight,
+            url_draft: self.update_url_input.read(cx).value().to_string(),
+            settings_path: self.settings_path.clone(),
+            store_path: self.state.store_path.clone(),
+        };
+        settings::render(cx, snapshot, self.update_url_input.clone())
+    }
+
     /// Environment page: snapshot the view-local state once and hand it to
     /// `env::render` (no re-entrant reads mid-layout).
     fn env_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1943,15 +2126,13 @@ impl Render for RootView {
         let theme_names = theme::theme_names(cx);
         let current_theme = self.settings.theme.clone();
         let current_locale = self.settings.locale.clone();
-        let settings_path = self.settings_path.clone();
-        let search_input = self.search_input.clone();
-        let discover_input = self.discover_input.clone();
         let weak = cx.weak_entity();
 
-        // Theme picker: lists every registered theme and applies the selection.
+        // Theme picker: lists every registered theme and applies the
+        // selection through the SHARED `apply_theme_setting` (settings
+        // page uses the same path, so persistence cannot drift).
         let theme_picker = {
             let weak = weak.clone();
-            let settings_path = settings_path.clone();
             let current = current_theme.clone();
             Button::new("theme-picker")
                 .outline()
@@ -1964,15 +2145,11 @@ impl Render for RootView {
                                 .checked(name == current)
                                 .on_click({
                                     let weak = weak.clone();
-                                    let settings_path = settings_path.clone();
                                     let name = name.clone();
                                     move |_, window, cx| {
-                                        theme::apply_theme(&name, window, cx);
                                         if let Some(view) = weak.upgrade() {
                                             view.update(cx, |this, cx| {
-                                                this.settings.theme = name.clone();
-                                                let _ = this.settings.save(&settings_path);
-                                                cx.notify();
+                                                this.apply_theme_setting(name.clone(), window, cx);
                                             });
                                         }
                                     }
@@ -1982,10 +2159,10 @@ impl Render for RootView {
                 })
         };
 
-        // Language picker: switches locale and persists the choice.
+        // Language picker: switches locale through the SHARED
+        // `apply_locale_setting` (persist + re-bake placeholders).
         let language_picker = {
             let weak = weak.clone();
-            let settings_path = settings_path.clone();
             let current = current_locale.clone();
             Button::new("language-picker")
                 .outline()
@@ -1998,36 +2175,12 @@ impl Render for RootView {
                                 .checked(code == current.as_str())
                                 .on_click({
                                     let weak = weak.clone();
-                                    let settings_path = settings_path.clone();
-                                    let search_input = search_input.clone();
-                                    let discover_input = discover_input.clone();
                                     move |_, window, cx| {
-                                        i18n::set_locale(code);
                                         if let Some(view) = weak.upgrade() {
                                             view.update(cx, |this, cx| {
-                                                this.settings.locale = code.to_string();
-                                                let _ = this.settings.save(&settings_path);
-                                                cx.notify();
+                                                this.apply_locale_setting(code, window, cx);
                                             });
                                         }
-                                        // The search placeholders were baked into
-                                        // InputState at startup; re-evaluate them
-                                        // from the new locale so they follow the
-                                        // language switch without a restart.
-                                        search_input.update(cx, |input, cx| {
-                                            input.set_placeholder(
-                                                t!("tools.search_installed").to_string(),
-                                                window,
-                                                cx,
-                                            )
-                                        });
-                                        discover_input.update(cx, |input, cx| {
-                                            input.set_placeholder(
-                                                t!("discover.search").to_string(),
-                                                window,
-                                                cx,
-                                            )
-                                        });
                                     }
                                 }),
                         )
@@ -2045,6 +2198,7 @@ impl Render for RootView {
             Selection::GlobalTasks | Selection::ProjectTasks(_) => {
                 self.tasks_pane(cx).into_any_element()
             }
+            Selection::Settings => self.settings_pane(cx).into_any_element(),
         };
 
         // The notice banner renders at the root, above the right pane, on

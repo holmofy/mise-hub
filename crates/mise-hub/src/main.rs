@@ -2,6 +2,7 @@ use gpui_kit::*;
 
 mod app;
 mod i18n;
+mod opener;
 mod state;
 mod theme;
 mod views;
