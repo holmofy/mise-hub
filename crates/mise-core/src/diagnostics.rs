@@ -53,18 +53,27 @@ pub const PROBES: &[(&str, &[&str], bool)] = &[
 ];
 
 /// A neutral working directory for the probes: the user's home directory,
-/// where mise's GLOBAL config lives and where no project config is
-/// expected. Without an explicit cwd the child would inherit the app
-/// process's cwd, and mise resolves its config by walking up from there —
-/// an unrelated project config (or an untrusted one) would then turn
-/// healthy capabilities red. Falls back to the temp directory when no
-/// home directory can be resolved.
-pub fn probe_cwd() -> Option<PathBuf> {
+/// where mise's GLOBAL config lives.
+///
+/// Without an explicit cwd the child would inherit the app process's cwd,
+/// and mise resolves its config by walking up from there — an unrelated
+/// project config (or an untrusted one) would then turn healthy
+/// capabilities red. The home directory is neutral with respect to
+/// PROJECT configs; note that a home-level `mise.toml` would still be
+/// discovered (that file *is* a config the user keeps next to their
+/// global config), and that the global config is deliberately in scope:
+/// a global-scope probe should see the global configuration.
+pub fn probe_cwd() -> PathBuf {
     match directories::UserDirs::new() {
-        Some(dirs) => Some(dirs.home_dir().to_path_buf()),
-        None => Some(std::env::temp_dir()),
+        Some(dirs) => dirs.home_dir().to_path_buf(),
+        None => std::env::temp_dir(),
     }
 }
+
+/// How long a single probe may take before it is reported as timed out.
+/// The network probe (`ls-remote`) is the slow one; without a bound a
+/// hanging request would keep the 「重新探测」 button disabled forever.
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests {
@@ -83,12 +92,17 @@ mod tests {
     struct FakeRunner {
         seen: Arc<Mutex<Vec<CommandRequest>>>,
         fail: Vec<String>,
+        slow: Vec<String>,
     }
 
     impl CommandRunner for FakeRunner {
         fn run(&self, req: &CommandRequest) -> Result<CommandOutput, CoreError> {
             self.seen.lock().unwrap().push(req.clone());
             let joined = req.args.join(" ");
+            if self.slow.contains(&joined) {
+                // Longer than the timeout the test passes in.
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
             if self.fail.contains(&joined) {
                 return Ok(CommandOutput {
                     code: 1,
@@ -115,12 +129,25 @@ mod tests {
     }
 
     fn mise_with(fail: Vec<String>) -> (Mise, Arc<Mutex<Vec<CommandRequest>>>) {
+        mise_with_behavior(fail, vec![])
+    }
+
+    /// A mise whose listed commands hang (used for the timeout test).
+    fn mise_with_slow(slow: Vec<String>) -> (Mise, Arc<Mutex<Vec<CommandRequest>>>) {
+        mise_with_behavior(vec![], slow)
+    }
+
+    fn mise_with_behavior(
+        fail: Vec<String>,
+        slow: Vec<String>,
+    ) -> (Mise, Arc<Mutex<Vec<CommandRequest>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mise = Mise::new(
             PathBuf::from("/usr/local/bin/mise"),
             Arc::new(FakeRunner {
                 seen: seen.clone(),
                 fail,
+                slow,
             }),
             Arc::new(NoopStreamer),
         );
@@ -170,13 +197,46 @@ mod tests {
         mise.diagnostics();
 
         let expected = probe_cwd();
+        let app_cwd = std::env::current_dir().ok();
         for req in seen.lock().unwrap().iter() {
             assert_eq!(
-                req.cwd, expected,
+                req.cwd.as_deref(),
+                Some(expected.as_path()),
                 "probe {:?} must not inherit the app's cwd",
                 req.args
             );
+            assert!(
+                req.cwd.is_some(),
+                "probe {:?} must carry an explicit cwd",
+                req.args
+            );
+            assert_ne!(
+                req.cwd.as_deref(),
+                app_cwd.as_deref(),
+                "probe {:?} must not run in the app's own working directory",
+                req.args
+            );
         }
+    }
+
+    /// A probe that hangs must not hang the whole report: it is reported
+    /// as failed with a timeout note, and the other probes still land.
+    #[test]
+    fn a_hanging_probe_is_reported_as_timed_out() {
+        let (mise, seen) = mise_with_slow(vec!["ls --json".into()]);
+        let report = mise.diagnostics_with_timeout(std::time::Duration::from_millis(50));
+
+        let ls = report.probes.iter().find(|p| p.name == "ls").unwrap();
+        assert!(!ls.ok, "the slow probe must not report success");
+        let detail = ls.detail.as_deref().unwrap();
+        assert!(
+            detail.contains("timed out"),
+            "timeout must be visible: {detail}"
+        );
+
+        // The other probes still ran (and the version was read).
+        assert!(report.probes.iter().filter(|p| p.ok).count() >= PROBES.len() - 1);
+        assert!(!seen.lock().unwrap().is_empty());
     }
 
     #[test]

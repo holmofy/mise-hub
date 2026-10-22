@@ -515,6 +515,9 @@ impl AppState {
                 return Err(e);
             }
         };
+        // The scope marker is a CLI FLAG shown verbatim (like `--bump` on
+        // the upgrade page), not prose — it is deliberately not part of
+        // the translated title.
         let scope = if global { " (--global)" } else { "" };
         let session = self
             .terminal

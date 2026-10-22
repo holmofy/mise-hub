@@ -228,6 +228,7 @@ settings:
   diagnostics_running: 探测中…
   diagnostics_idle: 尚未探测
   diagnostics_failed: 探测失败
+  diagnostics_worker_failed: 探测线程意外结束——请重新探测一次。
   mise_path: 可执行文件
   mise_version: 版本
   mise_version_unknown: 无法读取（mise --version 失败）
@@ -257,3 +258,4 @@ settings:
   update_open_page: 打开下载页
   update_open_failed: 无法打开浏览器
   update_failed: 更新检查失败
+  update_worker_failed: 更新检查线程意外结束——请重试。

@@ -380,9 +380,14 @@ impl RootView {
                 // thread that panicked (or a dropped sender) must not leave
                 // the 「重新探测」 button disabled for the rest of the session.
                 this.state.diagnostics_in_flight = false;
-                if let Ok(report) = result {
-                    this.state.diagnostics = Loadable::Ready(report);
-                }
+                this.state.diagnostics = match result {
+                    Ok(report) => Loadable::Ready(report),
+                    // The worker died without an answer — say so instead of
+                    // leaving the page on "Probing…" forever (rule 9).
+                    Err(_) => {
+                        Loadable::Failed(t!("settings.diagnostics_worker_failed").to_string())
+                    }
+                };
                 cx.notify();
             })
             .ok();
@@ -413,12 +418,13 @@ impl RootView {
                 // Cleared in both branches — a dead worker must not leave
                 // the check button permanently disabled.
                 this.state.update_in_flight = false;
-                if let Ok(result) = result {
-                    this.state.update = match result {
-                        Ok(check) => Loadable::Ready(check),
-                        Err(e) => Loadable::Failed(e.to_string()),
-                    };
-                }
+                this.state.update = match result {
+                    Ok(Ok(check)) => Loadable::Ready(check),
+                    Ok(Err(e)) => Loadable::Failed(e.to_string()),
+                    // The worker died without an answer — say so instead of
+                    // leaving the page on "Checking…" forever (rule 9).
+                    Err(_) => Loadable::Failed(t!("settings.update_worker_failed").to_string()),
+                };
                 cx.notify();
             })
             .ok();

@@ -1,4 +1,4 @@
-use crate::diagnostics::{DiagnosticsReport, PROBES, Probe, probe_cwd};
+use crate::diagnostics::{DiagnosticsReport, PROBE_TIMEOUT, PROBES, Probe, probe_cwd};
 use crate::env::{EnvDeclaration, EnvVar, parse_env_extended, parse_set_list};
 use crate::error::CoreError;
 use crate::manage::{UsePreview, parse_use_dry_run};
@@ -43,8 +43,15 @@ impl Mise {
         }
     }
 
+    /// The version reported by `mise --version`.
+    ///
+    /// Runs in the neutral probe directory like the capability probes, so
+    /// the app's own version display never depends on the directory the
+    /// GUI was started from (a deleted working directory would otherwise
+    /// make the child process fail to spawn at all).
     pub fn version(&self) -> Result<String, CoreError> {
-        let out = self.run(&["--version"], None)?;
+        let cwd = probe_cwd();
+        let out = self.run_in(&["--version"], None, Some(&cwd))?;
         Ok(parse_version(&out.stdout))
     }
 
@@ -64,15 +71,23 @@ impl Mise {
     /// the GUI was started could turn healthy capabilities red because of
     /// an unrelated project config (and could demand trusting it).
     pub fn diagnostics(&self) -> DiagnosticsReport {
+        self.diagnostics_with_timeout(PROBE_TIMEOUT)
+    }
+
+    /// [`Mise::diagnostics`] with an explicit per-probe timeout. A probe
+    /// that outlives it is reported as failed ("timed out after Ns")
+    /// instead of blocking the whole report — the network probe is the
+    /// one that can hang.
+    pub fn diagnostics_with_timeout(&self, timeout: std::time::Duration) -> DiagnosticsReport {
         let cwd = probe_cwd();
         let version = self
-            .run_in(&["--version"], None, cwd.as_deref())
+            .run_probe(&["--version"], Some(&cwd), timeout)
             .ok()
             .map(|out| parse_version(&out.stdout));
         let probes = PROBES
             .iter()
             .map(
-                |&(name, args, network)| match self.run_in(args, None, cwd.as_deref()) {
+                |&(name, args, network)| match self.run_probe(args, Some(&cwd), timeout) {
                     Ok(_) => Probe {
                         name,
                         ok: true,
@@ -92,6 +107,41 @@ impl Mise {
             program: self.program.clone(),
             version,
             probes,
+        }
+    }
+
+    /// Run one command with a hard time bound. The command runs on a
+    /// helper thread so a hanging child cannot block the caller; the
+    /// helper may outlive the timeout (the child process is not killed),
+    /// but its result is then discarded.
+    fn run_probe(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+        timeout: std::time::Duration,
+    ) -> Result<CommandOutput, CoreError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let program = self.program.clone();
+        let runner = self.runner.clone();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let cwd = cwd.map(|dir| dir.to_path_buf());
+        std::thread::spawn(move || {
+            let result = runner.run(&CommandRequest { program, args, cwd });
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(timeout) {
+            // A non-zero exit is a failure, exactly as in `Mise::run`:
+            // the probe records the RAW stderr, not a "success".
+            Ok(Ok(out)) if out.code != 0 => Err(CoreError::CommandFailed {
+                code: out.code,
+                stderr: out.stderr,
+            }),
+            Ok(Ok(out)) => Ok(out),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(CoreError::Other(format!(
+                "timed out after {}s",
+                timeout.as_secs()
+            ))),
         }
     }
 
