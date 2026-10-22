@@ -187,7 +187,7 @@ cargo fmt --all && cargo clippy --workspace --all-targets
 
 ## Current Status（2026-10-22）
 
-- 分支 `feat/m5`；M0–M5 全部实现完成，等待合并与 GUI 人工验收。
+- 分支 `main`（M5 已合并，merge commit `8eb42e3`）；M0–M5 全部实现完成，等待 GUI 人工验收。
 - 已完成：M0/M1（骨架、发现、安装、终端）+ M2（升级、卸载、应用版本、深度搜索、信任引导）+ M3（环境变量双视图/追溯/PATH/增删改/差异）+ M4（任务发现、依赖树、运行/监听）+ M5（设置/诊断页、更新检查、打包脚本 + GitHub Actions CI、README、i18n 补全）。
 - 自动化检查全绿：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`（282 passed）、`cargo build --workspace`。
 - 待人工验收：`cargo run -p mise-hub` 的 GUI 行为，逐项见 `docs/superpowers/plans/*-verification.md`。
