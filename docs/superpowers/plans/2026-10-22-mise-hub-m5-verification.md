@@ -64,6 +64,24 @@ RUNNING (pid 85693)      # 6 秒内无崩溃、日志无输出
 
 `shellcheck scripts/package-macos.sh` → 无告警（exit 0）。
 
+### 真实 mise 上的探测命令（mise 2026.10.15 macos-arm64）
+
+```
+[0] mise registry --json
+[0] mise ls --json
+[0] mise config ls --json
+[0] mise env --json-extended
+[0] mise tasks ls --json
+[0] mise outdated --json
+[0] mise ls-remote node --json
+```
+
+7 个探测命令在真实 mise 上全部 exit 0，即设置页的探测列表在正常环境下应全绿。
+（注：若在 zsh 里用 `mise $c` 这种不分割的写法复现，会看到
+`mise ERROR no tasks defined …`——那是 shell 把 "registry --json" 当成**一个**
+参数传给了 mise，mise 于是按任务名处理。App 侧传的是 `Vec<String>` 独立
+argv，不受影响。）
+
 ## M5 验收项
 
 | 项 | 结果 | 依据（inspection, file:line） |
